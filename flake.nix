@@ -1,6 +1,6 @@
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     flake-parts.url = "github:hercules-ci/flake-parts";
     crane.url = "github:ipetkov/crane";
 
@@ -25,6 +25,15 @@
         "aarch64-linux"
         "aarch64-darwin"
       ];
+      flake = {
+        nixConfig = {
+          extra-substituters = [ "https://n1.cachix.org" ];
+          extra-trusted-public-keys = [
+            "n1.cachix.org-1:vQ3RpPAz7vsJCg0PIWXYuzG+RrgV4fJ1uQkuEvcUfQI="
+          ];
+        };
+      };
+
       perSystem =
         {
           self',
@@ -49,18 +58,40 @@
                 cargoClippyExtraArgs = "--all-targets -- --deny=warnings";
               };
             in
-            attrs
-            // {
-              cargoArtifacts = craneLib.buildDepsOnly attrs;
+            attrs // { cargoArtifacts = craneLib.buildDepsOnly attrs; };
+
+          treefmt = pkgs.treefmt.withConfig {
+            runtimeInputs = [
+              pkgs.nixfmt
+              rust-toolchain
+            ];
+            settings = {
+              on-unmatched = "info";
+              formatter.nixfmt = {
+                command = "nixfmt";
+                options = [
+                  "--strict"
+                  "--width"
+                  80
+                ];
+                includes = [ "*.nix" ];
+              };
+              formatter.rustfmt = {
+                command = "rustfmt";
+                options = [
+                  "--config"
+                  "skip_children=true"
+                ];
+                includes = [ "*.rs" ];
+              };
             };
+          };
         in
         {
           _module.args.pkgs = import inputs.nixpkgs {
             inherit system;
             config.allowUnfree = true;
-            overlays = [
-              rust-overlay.overlays.default
-            ];
+            overlays = [ rust-overlay.overlays.default ];
           };
 
           checks = {
@@ -70,7 +101,11 @@
           };
 
           devShells.default = pkgs.mkShell {
-            buildInputs = [ rust-toolchain ];
+            buildInputs = [
+              pkgs.rustup
+              treefmt
+              pkgs.coreutils
+            ];
           };
         };
     };

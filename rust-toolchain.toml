@@ -1,4 +1,8 @@
 [toolchain]
-channel = "stable"
-components = ["rust-analyzer", "rust-src"]
+channel = "1.93.0"
+
+# Default profile includes `rustfmt`, `clippy`, `rust-docs`.
+# https://rust-lang.github.io/rustup/concepts/profiles.html
 profile = "default"
+components = ["rust-analyzer"]
+
