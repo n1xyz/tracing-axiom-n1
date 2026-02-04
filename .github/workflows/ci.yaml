@@ -17,6 +17,7 @@ jobs:
       - uses: DeterminateSystems/determinate-nix-action@v3
       - uses: DeterminateSystems/magic-nix-cache-action@v13
       - uses: DeterminateSystems/flake-checker-action@v12
+      - run: nix fmt -- --ci
       - run: nix flake check --print-build-logs
 
   aarch64-darwin:
