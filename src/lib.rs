@@ -1,20 +1,354 @@
-use rand::{Rng, SeedableRng, rngs};
-use serde::{Serialize, Serializer, ser::SerializeSeq};
-use std::{
-    borrow::Cow,
-    cell::RefCell,
-    collections::HashMap,
-    num::{NonZeroU64, NonZeroU128},
-};
-use time::OffsetDateTime;
-use tracing::field::{Field, Visit};
+use std::borrow::Cow;
+use std::num::NonZeroU64;
 
-pub mod background;
-pub mod builder;
 pub mod layer;
 
-pub use builder::{AXIOM_SERVER_EU, AXIOM_SERVER_US, Builder, builder};
 pub use reqwest::Url;
+
+pub struct Config<'a> {
+    pub api_key: &'a str,
+    pub base_url: reqwest::Url,
+    pub dataset: &'a str,
+    /// Event queue length. Will start dropping events once this is full
+    pub evt_que_len: usize,
+    pub service_name: &'static str,
+
+    /// Try to collect this many events before sending to axiom
+    pub collect_target: usize,
+    /// If we didn't collect up to target after this duratiom, timeout and send
+    /// what we have.
+    pub collect_timeout: std::time::Duration,
+}
+pub struct Axiom<X = Never> {
+    pub evt_tx: tokio::sync::mpsc::Sender<Event<X>>,
+    bg_task: tokio::task::JoinHandle<()>,
+}
+impl<X> Drop for Axiom<X> {
+    fn drop(&mut self) {
+        self.bg_task.abort();
+    }
+}
+pub fn init<X>(cfg: Config) -> Axiom<X>
+where
+    X: serde::Serialize + std::marker::Send + 'static,
+{
+    let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel(cfg.evt_que_len);
+
+    // NOTE: too much effort to bubble error here. this is run once on app init
+    //       so this is fine. spurious crashlooping is impossible as the
+    //       parsing is deterministic and config shouldn't be dynamic
+    let ingest_url = cfg
+        .base_url
+        .join("v1/datasets")
+        .unwrap()
+        .join(cfg.dataset)
+        .unwrap()
+        .join("ingest")
+        .unwrap();
+    let bearer = reqwest::header::HeaderValue::try_from(
+        format!("Bearer {}", cfg.api_key), //.
+    )
+    .unwrap();
+    let client = reqwest::Client::builder()
+        .user_agent(concat!(
+            env!("CARGO_PKG_NAME"),
+            "/",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .redirect(reqwest::redirect::Policy::custom(|a| {
+            let status = a.status().as_u16();
+            // the two redirect types that discard the body
+            if status == 302 || status == 303 {
+                let to = a.url().clone();
+                return a.error(LossyRedirect { status, to });
+            }
+            // delegate to default impl
+            reqwest::redirect::Policy::default().redirect(a)
+        }))
+        .build()
+        .unwrap();
+
+    let rt = tokio::runtime::Handle::current();
+    let bg_task = rt.spawn(async move {
+        use bytes::BufMut as _;
+        use std::ops::ControlFlow::{Break, Continue};
+
+        let mut zstd_ctx = zstd::zstd_safe::CCtx::try_create().unwrap();
+
+        let mut body = bytes::BytesMut::with_capacity(2048);
+        let mut evts_buf = Vec::with_capacity(cfg.collect_target);
+        let mut evts_count = 0;
+        loop {
+            body.clear();
+            let mut body_writer = body.writer();
+
+            let mut encoder = zstd::Encoder::with_context(
+                &mut body_writer, //.
+                &mut zstd_ctx,
+            );
+
+            match tokio::time::timeout(cfg.collect_timeout, async {
+                let mut rest = cfg.collect_target;
+                while rest > 0 {
+                    evts_buf.clear();
+                    let read = evt_rx.recv_many(&mut evts_buf, rest).await;
+                    assert_eq!(read, evts_buf.len());
+                    if read == 0 {
+                        // Channel is closed
+                        return Break(());
+                    }
+                    rest -= read;
+                    evts_count += read;
+
+                    for evt in &evts_buf {
+                        use std::io::Write as _;
+                        // ND-json: newline delimited
+                        serde_json::to_writer(
+                            &mut encoder,
+                            &EventWrapper {
+                                service: EventService {
+                                    name: cfg.service_name,
+                                },
+                                event: evt,
+                            },
+                        )
+                        .unwrap();
+                        encoder.write_all(b"\n").unwrap();
+                    }
+                }
+                assert!(evts_buf.len() == cfg.collect_target);
+                Continue(())
+            })
+            .await
+            {
+                // forward shutfown sentinel
+                Ok(Break(())) => return,
+                Ok(Continue(())) | Err(tokio::time::error::Elapsed { .. }) => {}
+            };
+            assert!(!evts_buf.is_empty());
+            assert!(evts_buf.len() <= cfg.collect_target);
+
+            encoder.finish().unwrap();
+            body = body_writer.into_inner();
+            let body_shared = body.freeze();
+
+            let mut backoff = std::time::Duration::from_millis(500);
+            let mut reached_max_retry = true;
+            const MAX_RETRIES: u16 = 100;
+            for i in 0..MAX_RETRIES {
+                let res = client
+                    .post(ingest_url.clone())
+                    .header(reqwest::header::AUTHORIZATION, &bearer)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .header(reqwest::header::CONTENT_ENCODING, "zstd")
+                    .body(body_shared.clone())
+                    .send()
+                    .await
+                    // axiom returns 200 with an error summary. nothing interesting
+                    // in body for other codes
+                    .and_then(|resp| resp.error_for_status());
+                match res {
+                    Ok(resp) => {
+                        let status_raw = resp.bytes().await.unwrap();
+                        let status: IngestStatus = serde_json::from_slice(&status_raw).unwrap();
+                        if status.failed > 0 || !status.failures.is_empty() {
+                            tracing::error!(
+                                ?backoff,
+                                attempt = i,
+                                status=?status_raw,
+                                evts_count,
+                                "axiom reported ingest failures");
+                        } else {
+                            reached_max_retry = false;
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            ?backoff, //.
+                            attempt = i,
+                            ?err,
+                            evts_count,
+                            "axiom request failed"
+                        );
+                    }
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.mul_f32(1.5);
+            }
+            if reached_max_retry {
+                tracing::error!(
+                    max_retries = MAX_RETRIES,
+                    evts_count,
+                    "reached max retries for ingest batch. dropping events!"
+                );
+            }
+
+            // cross our fingers and hope reqwest didn't keep any refs to body.
+            body = body_shared.into();
+        }
+    });
+
+    Axiom { evt_tx, bg_task }
+}
+
+pub fn layer<X: std::fmt::Debug>(evt_tx: tokio::sync::mpsc::Sender<Event<X>>) -> layer::Layer<X> {
+    layer::Layer::<X> {
+        // service_name,
+        sender: evt_tx,
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(untagged)]
+pub enum Event<Extra = Never> {
+    // see https://axiom.co/docs/query-data/traces
+    // for Axiom trace schema list of reserved field names:
+    // - _time
+    // - trace_id
+    // - span_id
+    // - parent_span_id
+    // - name
+    // - kind
+    // - duration
+    // - error
+    // - events
+    // - links
+    // - service.name // seems not documented but needed for trace explorer
+    // - level
+    //
+    // more optional otel cringe:
+    // - status.code
+    // - status.message
+    // - attributes
+    // - resource
+    //
+    // owr own extra stuff:
+    // - module_path
+    // - data
+    // - annotation_type
+    // - idle_ns
+    // - busy_ns
+    // - target
+    Log {
+        #[serde(rename = "_time", with = "time::serde::rfc3339")]
+        time: time::OffsetDateTime,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        trace_id: Option<std::num::NonZeroU128>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_span_id: Option<std::num::NonZeroU64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        module_path: Option<Cow<'static, str>>,
+        // TODO: derive error bool from level
+        // error: bool,
+        target: Cow<'static, str>,
+        level: Level,
+        name: Cow<'static, str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<Cow<'static, str>>,
+        /// This field is meant to be a map field in axiom
+        data: layer::FieldCascade,
+    },
+    Span {
+        #[serde(rename = "_time", with = "time::serde::rfc3339")]
+        time: time::OffsetDateTime,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_span_id: Option<std::num::NonZeroU64>,
+        #[serde(flatten, skip_serializing_if = "Option::is_none")]
+        span_info: Option<SpanInfo>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        module_path: Option<Cow<'static, str>>,
+        // TODO: derive error bool from level
+        // error: bool,
+        target: Cow<'static, str>,
+        level: Level,
+        name: Cow<'static, str>,
+        // We shouldn't need this but seems rust type inference and/or macro
+        // expansion order needs a little help.
+        #[serde(
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "layer::ser_option_field_cascade"
+        )]
+        /// This field is meant to be a map field in axiom
+        data: Option<std::sync::Arc<std::sync::Mutex<layer::FieldCascade>>>,
+    },
+    Extra(Extra),
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SpanInfo {
+    pub span_id: std::num::NonZeroU64,
+    pub trace_id: std::num::NonZeroU128,
+    pub duration_ns: u64,
+    pub idle_ns: u64,
+    pub busy_ns: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Level {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+impl From<tracing::Level> for Level {
+    fn from(value: tracing::Level) -> Self {
+        match value {
+            tracing::Level::TRACE => Level::Trace,
+            tracing::Level::DEBUG => Level::Debug,
+            tracing::Level::INFO => Level::Info,
+            tracing::Level::WARN => Level::Warn,
+            tracing::Level::ERROR => Level::Error,
+        }
+    }
+}
+
+// https://axiom.co/docs/restapi/endpoints/ingestIntoDataset
+#[allow(dead_code)]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestStatus {
+    failed: u64,
+    ingested: u64,
+    processed_bytes: u64,
+    blocks_created: Option<u32>,
+    failures: Vec<IngestFailure>,
+    wal_length: Option<u32>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestFailure {
+    error: String,
+    timestamp: String,
+}
+
+#[derive(Debug)]
+pub struct LossyRedirect {
+    status: u16,
+    to: Url,
+}
+
+impl std::fmt::Display for LossyRedirect {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        // Following such a redirect drops the request body, and will likely
+        // give an HTTP 200 response even though nobody ever looked at the POST
+        // body.
+        //
+        // This can e.g. happen for login redirects when you post to a
+        // login-protected URL.
+        write!(
+            f,
+            "lossy HTTP {} redirect to {} would cut off our body",
+            self.status, self.to
+        )
+    }
+}
+
+impl std::error::Error for LossyRedirect {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
@@ -23,7 +357,7 @@ pub enum Value {
     Bool(bool),
     Number(serde_json::Number),
     String(Cow<'static, str>),
-    Map(HashMap<Cow<'static, str>, Value>),
+    Map(std::collections::HashMap<Cow<'static, str>, Value>),
 }
 
 impl From<bool> for Value {
@@ -107,10 +441,10 @@ impl From<serde_json::Number> for Value {
     }
 }
 
-impl Serialize for Value {
+impl serde::Serialize for Value {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: Serializer,
+        S: serde::ser::Serializer,
     {
         match self {
             Self::Bool(b) => serializer.serialize_bool(*b),
@@ -121,118 +455,12 @@ impl Serialize for Value {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Default, Serialize)]
-pub struct Fields {
-    #[serde(flatten)]
-    pub fields: HashMap<Cow<'static, str>, Value>,
-}
-
-// see https://axiom.co/docs/query-data/traces?utm_source=chatgpt.com#trace-schema-overview
-// for Axiom trace schema list of reserved field names, all are
-// flattened/inlined when serialized (case insensitive):
-// _time
-// trace_id
-// span_id
-// parent_span_id
-// name
-// kind
-// duration
-// error
-// events
-// links
-// service.name // seems not documented but needed for trace explorer
-// level
-// more optional otel cringe:
-// - status.code
-// - status.message
-// - attributes
-// - resource
-// owr own extra stuff:
-// - module_path
-// - data
-// - annotation_type
-// - idle_ns
-// - busy_ns
-// - target
-
-impl Fields {
-    pub fn new() -> Self {
-        Self {
-            fields: HashMap::new(),
-        }
-    }
-
-    pub fn record<T: Into<Value>>(&mut self, field: &Field, value: T) {
-        self.fields
-            .insert(Cow::Borrowed(field.name()), value.into());
-    }
-}
-
-impl From<HashMap<Cow<'static, str>, Value>> for Fields {
-    fn from(value: HashMap<Cow<'static, str>, Value>) -> Self {
-        Self { fields: value }
-    }
-}
-
-impl Visit for Fields {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.record(field, format!("{:?}", value));
-    }
-    fn record_f64(&mut self, field: &Field, value: f64) {
-        self.record(field, value);
-    }
-    fn record_i64(&mut self, field: &Field, value: i64) {
-        self.record(field, value);
-    }
-    fn record_u64(&mut self, field: &Field, value: u64) {
-        self.record(field, value);
-    }
-    fn record_bool(&mut self, field: &Field, value: bool) {
-        self.record(field, value);
-    }
-    fn record_str(&mut self, field: &Field, value: &str) {
-        self.record(field, value);
-    }
-    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
-        self.record(field, value.to_string());
-
-        self.fields.insert(
-            Cow::Owned(format!("{}.debug", field.name())),
-            Value::String(Cow::Owned(format!("{:#?}", value))),
-        );
-
-        let mut chain: Vec<String> = Vec::new();
-        let mut next_err = value.source();
-        let mut i = 0;
-        while let Some(err) = next_err {
-            chain.push(format!("{:>4}: {}", i, err));
-            next_err = err.source();
-            i += 1;
-        }
-        self.fields.insert(
-            Cow::Owned(format!("{}.chain", field.name())),
-            Value::String(Cow::Owned(chain.join("\n"))),
-        );
-    }
-}
-
-thread_local! {
-    /// Store random number generator for each thread
-    static CURRENT_RNG: RefCell<rngs::SmallRng> = RefCell::new(rngs::SmallRng::from_os_rng());
-}
-
 /// A 8-byte value which identifies a given span.
 ///
 /// The id is valid if it contains at least one non-zero byte.
 #[derive(Clone, PartialEq, Eq, Copy, Hash)]
 #[repr(transparent)]
 pub struct SpanId(NonZeroU64);
-
-impl SpanId {
-    fn generate() -> Self {
-        CURRENT_RNG.with(|rng| Self::from(rng.borrow_mut().random::<NonZeroU64>()))
-    }
-}
 
 impl From<NonZeroU64> for SpanId {
     fn from(value: NonZeroU64) -> Self {
@@ -258,160 +486,28 @@ impl std::fmt::LowerHex for SpanId {
     }
 }
 
-impl Serialize for SpanId {
+impl serde::Serialize for SpanId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: Serializer,
+        S: serde::ser::Serializer,
     {
         serializer.serialize_str(format!("{}", self).as_ref())
     }
 }
 
-/// A 16-byte value which identifies a given trace.
-///
-/// The id is valid if it contains at least one non-zero byte.
-#[derive(Clone, PartialEq, Eq, Copy, Hash)]
-#[repr(transparent)]
-pub struct TraceId(NonZeroU128);
+#[derive(Clone, Copy, Debug, serde::Serialize, PartialEq)]
+pub enum Never {}
 
-impl TraceId {
-    fn generate() -> Self {
-        CURRENT_RNG.with(|rng| Self::from(rng.borrow_mut().random::<NonZeroU128>()))
-    }
-}
-
-impl From<NonZeroU128> for TraceId {
-    fn from(value: NonZeroU128) -> Self {
-        TraceId(value)
-    }
-}
-
-impl std::fmt::Debug for TraceId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{:032x}", self.0))
-    }
-}
-
-impl std::fmt::Display for TraceId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{:032x}", self.0))
-    }
-}
-
-impl std::fmt::LowerHex for TraceId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::LowerHex::fmt(&self.0, f)
-    }
-}
-
-impl Serialize for TraceId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(format!("{}", self).as_ref())
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Copy, Hash, Debug)]
-pub enum SpanKind {
-    CLIENT,
-    INTERNAL,
-    SERVER,
-    PRODUCER,
-    CONSUMER,
-}
-
-#[derive(Clone, Debug, Serialize, PartialEq)]
-pub struct OtelField {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub span_id: Option<SpanId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub trace_id: Option<TraceId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_span_id: Option<SpanId>,
-    pub kind: &'static str,
-    pub module_path: Cow<'static, str>,
-    #[serde(rename = "duration", skip_serializing_if = "Option::is_none")]
-    pub duration_ns: Option<u64>,
-    #[serde(rename = "_time", with = "time::serde::rfc3339")]
-    pub time: OffsetDateTime,
-    pub error: bool,
-}
-
-#[derive(Debug, Serialize, Clone, PartialEq)]
-pub struct AttributeField {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotation_type: Option<Cow<'static, str>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub idle_ns: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub busy_ns: Option<u64>,
-    pub target: Cow<'static, str>,
-}
-
-#[derive(Debug, Serialize, Clone, PartialEq)]
-pub struct EventField {
-    pub name: Cow<'static, str>,
-    pub level: &'static str,
-    // need to configure this into a map field in axiom
-    pub data: Fields,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<Cow<'static, str>>,
+#[derive(serde::Serialize)]
+struct EventWrapper<'a, X> {
+    // NOTE: Axiom wants this otel artifact for their tooling to work properly
+    //       ideally we'd just not have this or have this as an unnested
+    //       `service_name` field, but alas.
+    service: EventService<'a>,
     #[serde(flatten)]
-    pub extra_fields: Fields,
+    event: &'a Event<X>,
 }
-
-#[derive(Debug, Serialize, Clone, PartialEq)]
-pub struct ServiceField {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<Cow<'static, str>>,
-}
-
-#[derive(Clone, Debug, Serialize, PartialEq)]
-pub struct AxiomEvent {
-    // see https://axiom.co/docs/query-data/traces#browse-traces-with-the-opentelemetry-app for required field names
-    // first level fields
-    #[serde(flatten)]
-    pub otel: OtelField,
-    // attributes field
-    #[serde(flatten)]
-    pub attributes: AttributeField,
-    // events field
-    #[serde(flatten)]
-    pub event: EventField,
-    // resources field
-    #[serde(default)]
-    pub service: ServiceField,
-}
-
-pub type ExtraFields = Vec<(Cow<'static, str>, Value)>;
-
-pub struct CreateEventsPayload<'a> {
-    events: &'a Vec<AxiomEvent>,
-    extra_fields: &'a ExtraFields,
-}
-
-impl<'a> Serialize for CreateEventsPayload<'a> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut events_list = serializer.serialize_seq(None)?;
-        for event in self.events.iter() {
-            events_list.serialize_element(&CreateEventPayload {
-                event,
-                extra_fields: self.extra_fields,
-            })?;
-        }
-        events_list.end()
-    }
-}
-
-#[derive(Serialize)]
-struct CreateEventPayload<'a> {
-    #[serde(flatten)]
-    event: &'a AxiomEvent,
-    #[serde(skip_deserializing)]
-    extra_fields: &'a ExtraFields,
+#[derive(serde::Serialize)]
+struct EventService<'a> {
+    name: &'a str,
 }
