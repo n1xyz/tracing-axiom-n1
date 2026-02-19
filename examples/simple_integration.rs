@@ -10,8 +10,8 @@ const AXIOM_TEST_DATASET_NAME: &str = "porting_patch";
 // 1024 events max sent due to channel limit -- rest should be dropped
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
-    let api_key =
-        std::env::var("AXIOM_API_KEY").expect("AXIOM_API_KEY environment variable to be valid");
+    let api_key = std::env::var("AXIOM_API_KEY")
+        .expect("AXIOM_API_KEY environment variable to be valid");
     let (layer, task, controller) = tracing_axiomco::builder(&api_key)
         .service_name(std::borrow::Cow::Borrowed("test integration"))
         .build(tracing_axiomco::AXIOM_SERVER_US, AXIOM_TEST_DATASET_NAME)

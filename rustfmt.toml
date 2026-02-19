@@ -1,3 +1,19 @@
 edition = "2024"
 style_edition = "2024"
 group_imports = "StdExternalCrate"
+
+# Let me have two horizontal splits on my main screen and one on my laptop
+max_width = 80
+
+# Make me scroll less. Can easily opt-out of specific long lines with an empty
+# comment at the end of the line:
+# ```rs
+# something(
+#     long, //
+# );
+# ```
+use_small_heuristics = "Max"
+
+# unstable but encourages named args pattern and planned to be stabilized soon
+# https://github.com/rust-lang/rustfmt/issues/3370
+overflow_delimited_expr = true

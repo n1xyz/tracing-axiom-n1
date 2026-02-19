@@ -70,8 +70,9 @@ where
 
     let rt = tokio::runtime::Handle::current();
     let bg_task = rt.spawn(async move {
-        use bytes::BufMut as _;
         use std::ops::ControlFlow::{Break, Continue};
+
+        use bytes::BufMut as _;
 
         let mut zstd_ctx = zstd::zstd_safe::CCtx::try_create().unwrap();
 
@@ -103,15 +104,10 @@ where
                     for evt in &evts_buf {
                         use std::io::Write as _;
                         // ND-json: newline delimited
-                        serde_json::to_writer(
-                            &mut encoder,
-                            &EventWrapper {
-                                service: EventService {
-                                    name: cfg.service_name,
-                                },
-                                event: evt,
-                            },
-                        )
+                        serde_json::to_writer(&mut encoder, &EventWrapper {
+                            service: EventService { name: cfg.service_name },
+                            event: evt,
+                        })
                         .unwrap();
                         encoder.write_all(b"\n").unwrap();
                     }
@@ -150,7 +146,8 @@ where
                 match res {
                     Ok(resp) => {
                         let status_raw = resp.bytes().await.unwrap();
-                        let status: IngestStatus = serde_json::from_slice(&status_raw).unwrap();
+                        let status: IngestStatus =
+                            serde_json::from_slice(&status_raw).unwrap();
                         if status.failed > 0 || !status.failures.is_empty() {
                             tracing::error!(
                                 ?backoff,
@@ -192,7 +189,9 @@ where
     Axiom { evt_tx, bg_task }
 }
 
-pub fn layer<X: std::fmt::Debug>(evt_tx: tokio::sync::mpsc::Sender<Event<X>>) -> layer::Layer<X> {
+pub fn layer<X: std::fmt::Debug>(
+    evt_tx: tokio::sync::mpsc::Sender<Event<X>>,
+) -> layer::Layer<X> {
     layer::Layer::<X> {
         // service_name,
         sender: evt_tx,

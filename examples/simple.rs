@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::time::Duration;
+
 use tracing::Level;
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -51,8 +52,8 @@ impl Error for ErrorC {
 
 #[tokio::main]
 async fn main() {
-    let api_key =
-        std::env::var("AXIOM_API_KEY").expect("AXIOM_API_KEY environment variable to be valid");
+    let api_key = std::env::var("AXIOM_API_KEY")
+        .expect("AXIOM_API_KEY environment variable to be valid");
     let (layer, task, controller) = tracing_axiomco::builder(&api_key)
         .build(tracing_axiomco::AXIOM_SERVER_US, "test")
         .unwrap();
@@ -68,9 +69,7 @@ async fn main() {
         tracing::event!(tracing::Level::INFO, value = 42, "start");
         tokio::time::sleep(Duration::from_millis(100)).await;
         tracing::event!(tracing::Level::INFO, value = 42, "end");
-        let err = ErrorC {
-            source: ErrorB { source: ErrorA },
-        };
+        let err = ErrorC { source: ErrorB { source: ErrorA } };
         tracing::error!(
             error = &err as &dyn std::error::Error,
             "error opening nonexistant file"
