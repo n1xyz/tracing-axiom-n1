@@ -1,7 +1,8 @@
+use std::{borrow::Cow, fmt::Write, ops::DerefMut};
+
 use quanta::Instant;
 use rand::{Rng as _, SeedableRng as _};
 use serde::Serialize;
-use std::{borrow::Cow, fmt::Write, ops::DerefMut};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tracing::{Subscriber, span};
@@ -39,14 +40,21 @@ pub struct FieldCascade {
 }
 
 impl FieldCascade {
-    pub fn record(&mut self, field: &tracing::field::Field, value: impl Into<crate::Value>) {
-        self.fields
-            .insert(Cow::Borrowed(field.name()), value.into());
+    pub fn record(
+        &mut self,
+        field: &tracing::field::Field,
+        value: impl Into<crate::Value>,
+    ) {
+        self.fields.insert(Cow::Borrowed(field.name()), value.into());
     }
 }
 
 impl tracing::field::Visit for FieldCascade {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+    fn record_debug(
+        &mut self,
+        field: &tracing::field::Field,
+        value: &dyn std::fmt::Debug,
+    ) {
         self.record(field, format!("{:?}", value));
     }
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
@@ -140,13 +148,12 @@ impl<X: std::fmt::Debug + 'static, S: Subscriber + for<'a> LookupSpan<'a>>
             None => (None, None),
         };
 
-        let trace_id =
-            p_trace_id.unwrap_or_else(|| CURRENT_RNG.with(|rng| rng.borrow_mut().random()));
+        let trace_id = p_trace_id.unwrap_or_else(|| {
+            CURRENT_RNG.with(|rng| rng.borrow_mut().random())
+        });
 
-        let mut fields2 = FieldCascade {
-            parent: p_fields,
-            fields: Default::default(),
-        };
+        let mut fields2 =
+            FieldCascade { parent: p_fields, fields: Default::default() };
         attrs.record(&mut fields2);
 
         span.extensions_mut().insert(SpanExtra {
@@ -187,7 +194,11 @@ impl<X: std::fmt::Debug + 'static, S: Subscriber + for<'a> LookupSpan<'a>>
         );
     }
 
-    fn on_enter(&self, id: &span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_enter(
+        &self,
+        id: &span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         let span = ctx.span(id).unwrap();
         let mut e = span.extensions_mut();
         let Some(extra) = e.get_mut::<SpanExtra>() else {
@@ -197,12 +208,18 @@ impl<X: std::fmt::Debug + 'static, S: Subscriber + for<'a> LookupSpan<'a>>
         extra.timing.entered_depth += 1;
         if extra.timing.entered_depth == 1 {
             let now = Instant::now();
-            extra.timing.idle += now.saturating_duration_since(extra.timing.last).as_nanos() as u64;
+            extra.timing.idle += now
+                .saturating_duration_since(extra.timing.last)
+                .as_nanos() as u64;
             extra.timing.last = now;
         }
     }
 
-    fn on_exit(&self, id: &span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_exit(
+        &self,
+        id: &span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         let span = ctx.span(id).unwrap();
         let mut e = span.extensions_mut();
         let Some(extra) = e.get_mut::<SpanExtra>() else {
@@ -211,14 +228,21 @@ impl<X: std::fmt::Debug + 'static, S: Subscriber + for<'a> LookupSpan<'a>>
 
         if extra.timing.entered_depth == 1 {
             let now = Instant::now();
-            extra.timing.busy += now.saturating_duration_since(extra.timing.last).as_nanos() as u64;
+            extra.timing.busy += now
+                .saturating_duration_since(extra.timing.last)
+                .as_nanos() as u64;
             extra.timing.last = now;
         }
         // this could be -= 1 and panic on underflow
-        extra.timing.entered_depth = extra.timing.entered_depth.saturating_sub(1);
+        extra.timing.entered_depth =
+            extra.timing.entered_depth.saturating_sub(1);
     }
 
-    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         let span = ctx.event_span(event);
 
         let (parent_span_id, trace_id, s_fields) = match span.and_then(|p| {
@@ -226,20 +250,22 @@ impl<X: std::fmt::Debug + 'static, S: Subscriber + for<'a> LookupSpan<'a>>
                 .get::<SpanExtra>()
                 .map(|p| (p.span_id, p.trace_id, p.fields.clone()))
         }) {
-            Some((span_id, trace_id, fields)) => (Some(span_id), Some(trace_id), Some(fields)),
+            Some((span_id, trace_id, fields)) => {
+                (Some(span_id), Some(trace_id), Some(fields))
+            }
             None => (None, None, None),
         };
 
-        let mut fields = FieldCascade {
-            parent: s_fields,
-            fields: Default::default(),
-        };
+        let mut fields =
+            FieldCascade { parent: s_fields, fields: Default::default() };
         let meta = event.metadata();
         event.record(&mut fields);
 
         let message = match fields.fields.get("message") {
             Some(crate::Value::String(_)) => {
-                let Some(crate::Value::String(message)) = fields.fields.remove("message") else {
+                let Some(crate::Value::String(message)) =
+                    fields.fields.remove("message")
+                else {
                     unreachable!()
                 };
                 Some(message)
@@ -260,7 +286,11 @@ impl<X: std::fmt::Debug + 'static, S: Subscriber + for<'a> LookupSpan<'a>>
         });
     }
 
-    fn on_close(&self, id: span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_close(
+        &self,
+        id: span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         let now = Instant::now();
         let span = ctx.span(&id).unwrap();
 
