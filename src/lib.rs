@@ -1,9 +1,9 @@
 use std::borrow::Cow;
-use std::num::NonZeroU64;
-
-pub mod layer;
 
 pub use reqwest::Url;
+use tracing::instrument::WithSubscriber;
+
+pub mod layer;
 
 pub struct Config<'a> {
     pub api_key: &'a str,
@@ -20,14 +20,11 @@ pub struct Config<'a> {
     pub collect_timeout: std::time::Duration,
 }
 pub struct Axiom<X = Never> {
+    // NOTE: ORER MATTERS. this sender needs to be dropped before _bg_handle
     pub evt_tx: tokio::sync::mpsc::Sender<Event<X>>,
-    bg_task: tokio::task::JoinHandle<()>,
+    _bg_handle: BgHandle<X>,
 }
-impl<X> Drop for Axiom<X> {
-    fn drop(&mut self) {
-        self.bg_task.abort();
-    }
-}
+
 pub fn init<X>(cfg: Config) -> Axiom<X>
 where
     X: serde::Serialize + std::marker::Send + 'static,
@@ -39,11 +36,7 @@ where
     //       parsing is deterministic and config shouldn't be dynamic
     let ingest_url = cfg
         .base_url
-        .join("v1/datasets")
-        .unwrap()
-        .join(cfg.dataset)
-        .unwrap()
-        .join("ingest")
+        .join(&format!("v1/datasets/{}/ingest", cfg.dataset))
         .unwrap();
     let bearer = reqwest::header::HeaderValue::try_from(
         format!("Bearer {}", cfg.api_key), //.
@@ -69,7 +62,7 @@ where
         .unwrap();
 
     let rt = tokio::runtime::Handle::current();
-    let bg_task = rt.spawn(async move {
+    let bg_task = async move {
         use std::ops::ControlFlow::{Break, Continue};
 
         use bytes::BufMut as _;
@@ -78,8 +71,8 @@ where
 
         let mut body = bytes::BytesMut::with_capacity(2048);
         let mut evts_buf = Vec::with_capacity(cfg.collect_target);
-        let mut evts_count = 0;
         loop {
+            let mut evts_count = 0;
             body.clear();
             let mut body_writer = body.writer();
 
@@ -88,41 +81,54 @@ where
                 &mut zstd_ctx,
             );
 
-            match tokio::time::timeout(cfg.collect_timeout, async {
-                let mut rest = cfg.collect_target;
-                while rest > 0 {
-                    evts_buf.clear();
-                    let read = evt_rx.recv_many(&mut evts_buf, rest).await;
-                    assert_eq!(read, evts_buf.len());
-                    if read == 0 {
-                        // Channel is closed
-                        return Break(());
-                    }
-                    rest -= read;
-                    evts_count += read;
+            let mut rest = cfg.collect_target;
+            while evts_count == 0 {
+                match tokio::time::timeout(cfg.collect_timeout, async {
+                    while rest > 0 {
+                        evts_buf.clear();
+                        let read = evt_rx.recv_many(&mut evts_buf, rest).await;
+                        assert_eq!(read, evts_buf.len());
+                        if read == 0 {
+                            // Channel is closed
+                            if evts_count > 0 {
+                                // send what we have before shutting down
+                                return Continue(());
+                            }
+                            // shutdown
+                            return Break(());
+                        }
+                        rest -= read;
+                        evts_count += read;
 
-                    for evt in &evts_buf {
-                        use std::io::Write as _;
-                        // ND-json: newline delimited
-                        serde_json::to_writer(&mut encoder, &EventWrapper {
-                            service: EventService { name: cfg.service_name },
-                            event: evt,
-                        })
-                        .unwrap();
-                        encoder.write_all(b"\n").unwrap();
+                        for evt in &evts_buf {
+                            use std::io::Write as _;
+                            // ND-json: newline delimited
+                            serde_json::to_writer(
+                                &mut encoder,
+                                &EventWrapper {
+                                    service: EventService {
+                                        name: cfg.service_name,
+                                    },
+                                    event: evt,
+                                },
+                            )
+                            .unwrap();
+                            encoder.write_all(b"\n").unwrap();
+                        }
                     }
-                }
-                assert!(evts_buf.len() == cfg.collect_target);
-                Continue(())
-            })
-            .await
-            {
-                // forward shutfown sentinel
-                Ok(Break(())) => return,
-                Ok(Continue(())) | Err(tokio::time::error::Elapsed { .. }) => {}
-            };
-            assert!(!evts_buf.is_empty());
-            assert!(evts_buf.len() <= cfg.collect_target);
+                    assert!(evts_buf.len() == cfg.collect_target);
+                    Continue(())
+                })
+                .await
+                {
+                    // forward shutfown sentinel
+                    Ok(Break(())) => return,
+                    Ok(Continue(()))
+                    | Err(tokio::time::error::Elapsed { .. }) => {}
+                };
+            }
+            assert!(evts_count > 0);
+            assert!(evts_count <= cfg.collect_target);
 
             encoder.finish().unwrap();
             body = body_writer.into_inner();
@@ -139,13 +145,18 @@ where
                     .header(reqwest::header::CONTENT_ENCODING, "zstd")
                     .body(body_shared.clone())
                     .send()
+                    .with_current_subscriber()
                     .await
-                    // axiom returns 200 with an error summary. nothing interesting
-                    // in body for other codes
+                    // axiom returns 200 with an error summary. nothing
+                    // interesting in body for other codes
                     .and_then(|resp| resp.error_for_status());
                 match res {
                     Ok(resp) => {
-                        let status_raw = resp.bytes().await.unwrap();
+                        let status_raw = resp
+                            .bytes()
+                            .with_current_subscriber()
+                            .await
+                            .unwrap();
                         let status: IngestStatus =
                             serde_json::from_slice(&status_raw).unwrap();
                         if status.failed > 0 || !status.failures.is_empty() {
@@ -162,7 +173,7 @@ where
                     }
                     Err(err) => {
                         tracing::error!(
-                            ?backoff, //.
+                            ?backoff,
                             attempt = i,
                             ?err,
                             evts_count,
@@ -184,21 +195,64 @@ where
             // cross our fingers and hope reqwest didn't keep any refs to body.
             body = body_shared.into();
         }
-    });
+    };
+    let bg_task =
+        rt.spawn(bg_task.with_subscriber(tracing_core::Dispatch::none()));
 
-    Axiom { evt_tx, bg_task }
-}
-
-pub fn layer<X: std::fmt::Debug>(
-    evt_tx: tokio::sync::mpsc::Sender<Event<X>>,
-) -> layer::Layer<X> {
-    layer::Layer::<X> {
-        // service_name,
-        sender: evt_tx,
+    Axiom {
+        evt_tx: evt_tx.clone(),
+        _bg_handle: BgHandle { evt_tx: Some(evt_tx), handle: bg_task },
     }
 }
 
-#[derive(Debug, serde::Serialize)]
+struct BgHandle<X> {
+    evt_tx: Option<tokio::sync::mpsc::Sender<Event<X>>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+impl<X> Drop for BgHandle<X> {
+    fn drop(&mut self) {
+        tokio::task::block_in_place(move || {
+            let evt_tx = self.evt_tx.take().unwrap();
+            let senders = evt_tx.strong_count() - 1;
+            if senders > 0 {
+                tracing::error!(
+                    senders,
+                    "dropped Axiom handle while event senders still exist!"
+                );
+            }
+            let len = evt_tx.max_capacity() - evt_tx.capacity();
+            // This should be the last strong sender and so close the channel.
+            // The bg task will detect this for a graceful shutdown.
+            tracing::error!("should be closed now");
+            drop(evt_tx);
+
+            let rt = tokio::runtime::Handle::current();
+            match rt.block_on(
+                tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut self.handle)
+                    .with_subscriber(tracing_core::Dispatch::none()),
+            ) {
+                Ok(join_res) => join_res.unwrap(),
+                Err(tokio::time::error::Elapsed { .. }) => {
+                    tracing::error!(
+                        approx_dropped_evts = len,
+                        timeout = ?SHUTDOWN_TIMEOUT,
+                        "ERROR: shutdown timed out."
+                    );
+                }
+            }
+        });
+    }
+}
+
+pub fn layer<X>(
+    evt_tx: tokio::sync::mpsc::Sender<Event<X>>,
+) -> layer::Layer<X> {
+    layer::Layer::<X> { sender: evt_tx.downgrade() }
+}
+
+#[derive(serde::Serialize)]
 #[serde(untagged)]
 pub enum Event<Extra = Never> {
     // see https://axiom.co/docs/query-data/traces
@@ -232,14 +286,19 @@ pub enum Event<Extra = Never> {
     Log {
         #[serde(rename = "_time", with = "time::serde::rfc3339")]
         time: time::OffsetDateTime,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        trace_id: Option<std::num::NonZeroU128>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        parent_span_id: Option<std::num::NonZeroU64>,
+        kind: BogusKind,
+        #[serde(
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "ser_opt_hex"
+        )]
+        trace_id: Option<[u8; 16]>,
+        #[serde(
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "ser_opt_hex"
+        )]
+        parent_span_id: Option<[u8; 8]>,
         #[serde(skip_serializing_if = "Option::is_none")]
         module_path: Option<Cow<'static, str>>,
-        // TODO: derive error bool from level
-        // error: bool,
         target: Cow<'static, str>,
         level: Level,
         name: Cow<'static, str>,
@@ -251,14 +310,16 @@ pub enum Event<Extra = Never> {
     Span {
         #[serde(rename = "_time", with = "time::serde::rfc3339")]
         time: time::OffsetDateTime,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        parent_span_id: Option<std::num::NonZeroU64>,
+        kind: BogusKind,
+        #[serde(
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "ser_opt_hex"
+        )]
+        parent_span_id: Option<[u8; 8]>,
         #[serde(flatten, skip_serializing_if = "Option::is_none")]
         span_info: Option<SpanInfo>,
         #[serde(skip_serializing_if = "Option::is_none")]
         module_path: Option<Cow<'static, str>>,
-        // TODO: derive error bool from level
-        // error: bool,
         target: Cow<'static, str>,
         level: Level,
         name: Cow<'static, str>,
@@ -274,10 +335,24 @@ pub enum Event<Extra = Never> {
     Extra(Extra),
 }
 
+/// Axiom absolutely wants this for trace/span recognition so here it is.
+pub struct BogusKind;
+impl serde::Serialize for BogusKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str("server")
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct SpanInfo {
-    pub span_id: std::num::NonZeroU64,
-    pub trace_id: std::num::NonZeroU128,
+    #[serde(serialize_with = "ser_hex")]
+    pub span_id: [u8; 8],
+    #[serde(serialize_with = "ser_hex")]
+    pub trace_id: [u8; 16],
+    #[serde(rename = "duration")]
     pub duration_ns: u64,
     pub idle_ns: u64,
     pub busy_ns: u64,
@@ -328,7 +403,7 @@ struct IngestFailure {
 #[derive(Debug)]
 pub struct LossyRedirect {
     status: u16,
-    to: Url,
+    to: reqwest::Url,
 }
 
 impl std::fmt::Display for LossyRedirect {
@@ -454,46 +529,6 @@ impl serde::Serialize for Value {
     }
 }
 
-/// A 8-byte value which identifies a given span.
-///
-/// The id is valid if it contains at least one non-zero byte.
-#[derive(Clone, PartialEq, Eq, Copy, Hash)]
-#[repr(transparent)]
-pub struct SpanId(NonZeroU64);
-
-impl From<NonZeroU64> for SpanId {
-    fn from(value: NonZeroU64) -> Self {
-        SpanId(value)
-    }
-}
-
-impl std::fmt::Debug for SpanId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{:016x}", self.0))
-    }
-}
-
-impl std::fmt::Display for SpanId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{:016x}", self.0))
-    }
-}
-
-impl std::fmt::LowerHex for SpanId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::LowerHex::fmt(&self.0, f)
-    }
-}
-
-impl serde::Serialize for SpanId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::ser::Serializer,
-    {
-        serializer.serialize_str(format!("{}", self).as_ref())
-    }
-}
-
 #[derive(Clone, Copy, Debug, serde::Serialize, PartialEq)]
 pub enum Never {}
 
@@ -509,4 +544,40 @@ struct EventWrapper<'a, X> {
 #[derive(serde::Serialize)]
 struct EventService<'a> {
     name: &'a str,
+}
+
+fn ser_hex<const N: usize, S>(
+    bytes: &[u8; N],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::ser::Serializer,
+{
+    fn chr(v: u8) -> u8 {
+        u8::try_from(char::from_digit(v.into(), 16).unwrap()).unwrap()
+    }
+
+    // max size in onur use case is trace id which is 16 bytes
+    const BUF_LEN: usize = 32;
+    assert!(N * 2 <= BUF_LEN);
+    let mut buf = [0u8; BUF_LEN];
+
+    for (i, b) in bytes.iter().enumerate() {
+        buf[i * 2] = chr(b / 16);
+        buf[i * 2 + 1] = chr(b % 16);
+    }
+
+    serializer.serialize_str(unsafe { str::from_utf8_unchecked(&buf) })
+}
+fn ser_opt_hex<const N: usize, S>(
+    bytes: &Option<[u8; N]>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::ser::Serializer,
+{
+    match bytes {
+        Some(bytes) => ser_hex(bytes, serializer),
+        None => serializer.serialize_none(),
+    }
 }

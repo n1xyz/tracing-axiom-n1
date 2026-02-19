@@ -11,8 +11,8 @@ use tracing_subscriber::registry::LookupSpan;
 use crate::Event;
 
 struct SpanExtra {
-    span_id: std::num::NonZeroU64,
-    trace_id: std::num::NonZeroU128,
+    span_id: [u8; 8],
+    trace_id: [u8; 16],
     timing: Timing,
     fields: std::sync::Arc<std::sync::Mutex<FieldCascade>>,
 }
@@ -25,17 +25,9 @@ struct Timing {
     entered_depth: u64,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug)]
 pub struct FieldCascade {
-    #[serde(
-        flatten,
-        skip_serializing_if = "Option::is_none",
-        // We shouldn't need this but seems rust type inference and/or macro
-        // expansion order needs a little help.
-        serialize_with = "ser_option_field_cascade"
-    )]
     parent: Option<std::sync::Arc<std::sync::Mutex<FieldCascade>>>,
-    #[serde(flatten)]
     fields: std::collections::HashMap<Cow<'static, str>, crate::Value>,
 }
 
@@ -46,6 +38,34 @@ impl FieldCascade {
         value: impl Into<crate::Value>,
     ) {
         self.fields.insert(Cow::Borrowed(field.name()), value.into());
+    }
+
+    fn serialize_fields<S>(&self, map: &mut S) -> Result<(), S::Error>
+    where
+        S: serde::ser::SerializeMap,
+    {
+        if let Some(parent) = &self.parent {
+            parent.lock().unwrap().serialize_fields(&mut *map)?;
+        }
+        for (k, v) in &self.fields {
+            map.serialize_entry(k, v)?;
+        }
+        Ok(())
+    }
+}
+
+// manual impl as serde derive tries to do the recursion in generic
+// instantiation as opposed to at runtime for some reason and this
+// makes the compiler crash.
+impl serde::Serialize for FieldCascade {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap as _;
+        let mut map = serializer.serialize_map(None)?;
+        self.serialize_fields(&mut map)?;
+        map.end()
     }
 }
 
@@ -104,23 +124,63 @@ impl tracing::field::Visit for FieldCascade {
 }
 
 pub struct Layer<X> {
-    pub sender: mpsc::Sender<Event<X>>,
+    pub sender: mpsc::WeakSender<Event<X>>,
 }
 
-impl<X: std::fmt::Debug> Layer<X> {
+impl<X: serde::Serialize> Layer<X> {
     fn enqueue_event(&self, evt: Event<X>) {
-        match self.sender.try_send(evt) {
+        // NOTE: this might be fast or slow idk. maybe we should use kanal
+        //       so that channel can be explicitly closed instead of
+        //       relying solely on tx count.
+        let Some(sender) = self.sender.upgrade() else {
+            fake_log_field(
+                "ERROR: queue closed. dropping event.",
+                "event",
+                &evt,
+            );
+            return;
+        };
+        match sender.try_send(evt) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Closed(e)) => tracing::error!(
-                event=?e,
-                "event queue closed while still sending event"
-            ),
-            Err(mpsc::error::TrySendError::Full(e)) => tracing::error!(
-                event=?e,
-                "dropping event due to full queue"
-            ),
+            Err(mpsc::error::TrySendError::Closed(e)) => {
+                fake_log_field(
+                    "ERROR: queue closed. dropping event.",
+                    "event",
+                    &e,
+                );
+            }
+            Err(mpsc::error::TrySendError::Full(e)) => {
+                fake_log_field(
+                    "ERROR: queue full. dropping event.",
+                    "event",
+                    &e,
+                );
+            }
         }
     }
+}
+
+fn fake_log_prefix(stderr: &mut impl std::io::Write, msg: &str) {
+    time::OffsetDateTime::now_utc()
+        .format_into(
+            &mut *stderr,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+    write!(&mut *stderr, " {}", msg).unwrap();
+}
+pub(crate) fn fake_log_field(
+    msg: &str,
+    k: &'static str,
+    v: &impl serde::Serialize,
+) {
+    use std::io::Write as _;
+    let mut stderr = std::io::stderr();
+
+    fake_log_prefix(&mut stderr, msg);
+    write!(&mut stderr, " {k}=").unwrap();
+    serde_json::ser::to_writer(&mut stderr, v).unwrap();
+    writeln!(&mut stderr).unwrap();
 }
 
 thread_local! {
@@ -128,7 +188,7 @@ thread_local! {
     static CURRENT_RNG: std::cell::RefCell<rand::rngs::SmallRng> = std::cell::RefCell::new(rand::rngs::SmallRng::from_os_rng());
 }
 
-impl<X: std::fmt::Debug + 'static, S: Subscriber + for<'a> LookupSpan<'a>>
+impl<X: serde::Serialize + 'static, S: Subscriber + for<'a> LookupSpan<'a>>
     tracing_subscriber::Layer<S> for Layer<X>
 {
     fn on_new_span(
@@ -274,10 +334,10 @@ impl<X: std::fmt::Debug + 'static, S: Subscriber + for<'a> LookupSpan<'a>>
         };
         self.enqueue_event(Event::Log {
             time: OffsetDateTime::now_utc(),
+            kind: crate::BogusKind,
             trace_id,
             parent_span_id,
             module_path: meta.module_path().map(Cow::Borrowed),
-            // error: *meta.level() <= Level::ERROR,
             target: Cow::Borrowed(meta.target()),
             level: crate::Level::from(*meta.level()),
             name: Cow::Borrowed(meta.name()),
@@ -297,35 +357,34 @@ impl<X: std::fmt::Debug + 'static, S: Subscriber + for<'a> LookupSpan<'a>>
         let parent_span_id = span
             .parent()
             .and_then(|p| p.extensions().get::<SpanExtra>().map(|p| p.span_id));
-        let (time, data, span_info) = match span
-            .parent()
-            .and_then(|p| p.extensions_mut().remove::<SpanExtra>())
-        {
-            Some(e) => (
-                Some(e.timing.start_dt),
-                Some(e.fields),
-                Some(crate::SpanInfo {
-                    span_id: e.span_id,
-                    trace_id: e.trace_id,
-                    duration_ns: now
-                        .saturating_duration_since(e.timing.start_instant)
-                        .as_nanos() as u64,
-                    idle_ns: e.timing.idle,
-                    busy_ns: e.timing.busy,
-                }),
-            ),
-            None => (None, None, None),
-        };
+        let (time, data, span_info) =
+            match span.extensions_mut().remove::<SpanExtra>() {
+                Some(e) => (
+                    Some(e.timing.start_dt),
+                    Some(e.fields),
+                    Some(crate::SpanInfo {
+                        span_id: e.span_id,
+                        trace_id: e.trace_id,
+                        duration_ns: now
+                            .saturating_duration_since(e.timing.start_instant)
+                            .as_nanos()
+                            as u64,
+                        idle_ns: e.timing.idle,
+                        busy_ns: e.timing.busy,
+                    }),
+                ),
+                None => (None, None, None),
+            };
 
         let meta = span.metadata();
 
         self.enqueue_event(Event::Span {
             time: time.unwrap_or_else(OffsetDateTime::now_utc),
+            kind: crate::BogusKind,
             parent_span_id,
             span_info,
             module_path: meta.module_path().map(Cow::Borrowed),
             target: Cow::Borrowed(meta.target()),
-            // error: *meta.level() <= Level::ERROR,
             level: crate::Level::from(*meta.level()),
             name: Cow::Borrowed(meta.name()),
             data,
