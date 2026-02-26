@@ -23,8 +23,8 @@ async fn main() {
     let api_key = std::env::var("AXIOM_API_KEY")
         .expect("AXIOM_API_KEY environment variable to be valid");
 
-    let axiom: tracing_axiomco::Axiom =
-        tracing_axiomco::init(tracing_axiomco::Config {
+    let axiom: tracing_axiom::Axiom =
+        tracing_axiom::init(tracing_axiom::Config {
             evt_que_len: 4 << 10,
             service_name: "example-service",
             base_url: "https://api.axiom.co".parse().unwrap(),
@@ -42,7 +42,7 @@ async fn main() {
                 .parse_lossy(std::env::var("RUST_LOG").unwrap_or_default()),
         )
         .with(tracing_subscriber::fmt::layer())
-        .with(tracing_axiomco::layer(axiom.evt_tx.clone()));
+        .with(tracing_axiom::layer(axiom.evt_tx.clone()));
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
     async {
@@ -59,4 +59,14 @@ async fn main() {
     }
     .instrument(tracing::info_span!("parent span"))
     .await;
+
+    // Try panicking to see the last-ditch effort Drop impl take effect!
+    //
+    // panic!("test");
+    // std::thread::spawn(|| panic!("test"));
+
+    // Try commenting this line and be punished for letting axiom be
+    // dropped >:D
+    //
+    axiom.deinit().await;
 }

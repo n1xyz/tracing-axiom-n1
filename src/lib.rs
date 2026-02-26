@@ -1,7 +1,44 @@
+//! # tracing-axiom
+//!
+//! [Axiom.co](axiom.co) backend for the tracing crate.
+//!
+//! ## Usage
+//!
+//! Assumptions:
+//! - `tokio` async runtime.
+//! - `data` field configured as a mapped field in axiom dataset.
+//!
+//! ```rs
+//! let axiom: tracing_axiom::Axiom =
+//!     tracing_axiom::init(tracing_axiom::Config {
+//!         evt_que_len: 4 << 10,
+//!         service_name: "example-service",
+//!         base_url: "https://api.axiom.co".parse().unwrap(),
+//!         api_key: &api_key,
+//!         dataset: "example-dataset",
+//!         collect_target: 4 << 10,
+//!         collect_timeout: std::time::Duration::from_millis(500),
+//!     });
+//!
+//! // NOTE: can clone `axiom.evt_tx` and send custom events to it as long as they
+//! //       implement `serde::Serialize`.
+//!
+//! let subscriber = tracing_subscriber::registry()
+//!     .with(tracing_subscriber::fmt::layer())
+//!     .with(tracing_axiom::layer(axiom.evt_tx.clone()));
+//! tracing::subscriber::set_global_default(subscriber).unwrap();
+//!
+//! // Don't forget to deinit! Drop will panic!
+//! axiom.deinit().await;
+//! ```
+//!
+//! See `examples/simple.rs` for a working example.
+//!
+
 use std::borrow::Cow;
 
 pub use reqwest::Url;
-use tracing::instrument::WithSubscriber;
+use tracing::instrument::WithSubscriber as _;
 
 pub mod layer;
 
@@ -19,10 +56,10 @@ pub struct Config<'a> {
     /// what we have.
     pub collect_timeout: std::time::Duration,
 }
-pub struct Axiom<X = Never> {
+pub struct Axiom<X: Send = Never> {
     // NOTE: ORER MATTERS. this sender needs to be dropped before _bg_handle
     pub evt_tx: tokio::sync::mpsc::Sender<Event<X>>,
-    _bg_handle: BgHandle<X>,
+    bg_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub fn init<X>(cfg: Config) -> Axiom<X>
@@ -145,18 +182,13 @@ where
                     .header(reqwest::header::CONTENT_ENCODING, "zstd")
                     .body(body_shared.clone())
                     .send()
-                    .with_current_subscriber()
                     .await
                     // axiom returns 200 with an error summary. nothing
                     // interesting in body for other codes
                     .and_then(|resp| resp.error_for_status());
                 match res {
                     Ok(resp) => {
-                        let status_raw = resp
-                            .bytes()
-                            .with_current_subscriber()
-                            .await
-                            .unwrap();
+                        let status_raw = resp.bytes().await.unwrap();
                         let status: IngestStatus =
                             serde_json::from_slice(&status_raw).unwrap();
                         if status.failed > 0 || !status.failures.is_empty() {
@@ -201,48 +233,60 @@ where
 
     Axiom {
         evt_tx: evt_tx.clone(),
-        _bg_handle: BgHandle { evt_tx: Some(evt_tx), handle: bg_task },
+        bg_handle: Some(bg_task),
+        // _bg_handle: BgHandle { evt_tx: Some(evt_tx), handle: bg_task },
     }
 }
 
-struct BgHandle<X> {
-    evt_tx: Option<tokio::sync::mpsc::Sender<Event<X>>>,
-    handle: tokio::task::JoinHandle<()>,
+impl<X: Send> Axiom<X> {
+    /// Call this instead of dropping! Drop doesn't support async
+    pub async fn deinit(self) {
+        // Non-dropping destructure. We drop the fields in this fn ourselves.
+        let (evt_tx, bg_handle) = unsafe {
+            let this = std::mem::ManuallyDrop::new(self);
+            let Axiom { evt_tx, bg_handle } = &*this;
+            (std::ptr::read(evt_tx), std::ptr::read(bg_handle))
+        };
+
+        let senders = evt_tx.strong_count() - 1;
+        if senders > 0 {
+            tracing::warn!(
+                senders,
+                "deinit Axiom handle while event senders still exist!"
+            );
+        }
+        // This should be the last strong sender and so close the channel.
+        // The bg task will detect this for a graceful shutdown.
+        drop(evt_tx);
+
+        bg_handle.unwrap().await.unwrap();
+    }
 }
 
-const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-impl<X> Drop for BgHandle<X> {
+// RAII + async = nonsense
+//
+/// Please DO NOT rely on this drop handler. This is nasty nonsense in
+/// case of real panics.
+///
+/// Might even be worth catching panics in the calling code if it makes
+/// sense so that the caller can properly call deinit().
+impl<X: Send> Drop for Axiom<X> {
     fn drop(&mut self) {
-        tokio::task::block_in_place(move || {
-            let evt_tx = self.evt_tx.take().unwrap();
-            let senders = evt_tx.strong_count() - 1;
-            if senders > 0 {
-                tracing::error!(
-                    senders,
-                    "dropped Axiom handle while event senders still exist!"
-                );
-            }
-            let len = evt_tx.max_capacity() - evt_tx.capacity();
-            // This should be the last strong sender and so close the channel.
-            // The bg task will detect this for a graceful shutdown.
-            tracing::error!("should be closed now");
-            drop(evt_tx);
+        // This is a last ditch effort to not drop events.
+        let mut bogus =
+            Self { evt_tx: tokio::sync::mpsc::channel(1).0, bg_handle: None };
+        std::mem::swap(self, &mut bogus);
+        let actual = bogus;
 
+        // block_in_place depends on a tokio feature flag.
+        std::thread::scope(move |s| {
             let rt = tokio::runtime::Handle::current();
-            match rt.block_on(
-                tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut self.handle)
-                    .with_subscriber(tracing_core::Dispatch::none()),
-            ) {
-                Ok(join_res) => join_res.unwrap(),
-                Err(tokio::time::error::Elapsed { .. }) => {
-                    tracing::error!(
-                        approx_dropped_evts = len,
-                        timeout = ?SHUTDOWN_TIMEOUT,
-                        "ERROR: shutdown timed out."
-                    );
-                }
-            }
+            s.spawn(move || rt.block_on(actual.deinit()));
         });
+
+        if !std::thread::panicking() {
+            panic!("call Axiom::deinit() instead of dropping it!");
+        }
     }
 }
 
@@ -255,38 +299,22 @@ pub fn layer<X>(
 #[derive(serde::Serialize)]
 #[serde(untagged)]
 pub enum Event<Extra = Never> {
-    // see https://axiom.co/docs/query-data/traces
-    // for Axiom trace schema list of reserved field names:
-    // - _time
-    // - trace_id
-    // - span_id
-    // - parent_span_id
-    // - name
-    // - kind
-    // - duration
-    // - error
-    // - events
-    // - links
-    // - service.name // seems not documented but needed for trace explorer
-    // - level
+    // Order of fields is optimized for json human readability.
     //
-    // more optional otel cringe:
-    // - status.code
-    // - status.message
-    // - attributes
-    // - resource
-    //
-    // owr own extra stuff:
-    // - module_path
-    // - data
-    // - annotation_type
-    // - idle_ns
-    // - busy_ns
-    // - target
+    // For Axiom trace schema list of required field names for tracing
+    // integration, see https://axiom.co/docs/query-data/traces
     Log {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<Cow<'static, str>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        module_path: Option<Cow<'static, str>>,
+        target: Cow<'static, str>,
+        level: Level,
+        name: Cow<'static, str>,
+        /// This field is meant to be a map field in axiom
+        data: layer::FieldCascade,
         #[serde(rename = "_time", with = "time::serde::rfc3339")]
         time: time::OffsetDateTime,
-        kind: BogusKind,
         #[serde(
             skip_serializing_if = "Option::is_none",
             serialize_with = "ser_opt_hex"
@@ -297,27 +325,9 @@ pub enum Event<Extra = Never> {
             serialize_with = "ser_opt_hex"
         )]
         parent_span_id: Option<[u8; 8]>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        module_path: Option<Cow<'static, str>>,
-        target: Cow<'static, str>,
-        level: Level,
-        name: Cow<'static, str>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        message: Option<Cow<'static, str>>,
-        /// This field is meant to be a map field in axiom
-        data: layer::FieldCascade,
+        kind: BogusKind,
     },
     Span {
-        #[serde(rename = "_time", with = "time::serde::rfc3339")]
-        time: time::OffsetDateTime,
-        kind: BogusKind,
-        #[serde(
-            skip_serializing_if = "Option::is_none",
-            serialize_with = "ser_opt_hex"
-        )]
-        parent_span_id: Option<[u8; 8]>,
-        #[serde(flatten, skip_serializing_if = "Option::is_none")]
-        span_info: Option<SpanInfo>,
         #[serde(skip_serializing_if = "Option::is_none")]
         module_path: Option<Cow<'static, str>>,
         target: Cow<'static, str>,
@@ -331,6 +341,16 @@ pub enum Event<Extra = Never> {
         )]
         /// This field is meant to be a map field in axiom
         data: Option<std::sync::Arc<std::sync::Mutex<layer::FieldCascade>>>,
+        #[serde(rename = "_time", with = "time::serde::rfc3339")]
+        time: time::OffsetDateTime,
+        #[serde(flatten, skip_serializing_if = "Option::is_none")]
+        span_info: Option<SpanInfo>,
+        #[serde(
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "ser_opt_hex"
+        )]
+        parent_span_id: Option<[u8; 8]>,
+        kind: BogusKind,
     },
     Extra(Extra),
 }
