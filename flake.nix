@@ -49,19 +49,24 @@
             pkgs.rust-bin.nightly."${rust-nightly-version}".default;
           craneLib = (crane.mkLib pkgs).overrideToolchain (_: rust-toolchain);
 
-          craneAttrs =
-            let
-              attrs = {
-                src = craneLib.cleanCargoSource ./.;
-                strictDeps = true;
-                doCheck = false;
-                cargoTestCommand = "cargo test"; # disable release
-                cargoCheckCommand = "cargo clippy"; # use clippy, disable release
-                cargoCheckExtraArgs = "--all-targets -- --deny=warnings";
-                cargoClippyExtraArgs = "--all-targets -- --deny=warnings";
-              };
-            in
-            attrs // { cargoArtifacts = craneLib.buildDepsOnly attrs; };
+          craneCommon = rec {
+            src = craneLib.cleanCargoSource ./.;
+            strictDeps = true;
+            cargoTestCommand = "cargo test";
+            cargoCheckCommand = "cargo clippy --profile release";
+            cargoCheckExtraArgs = "--all-targets -- --deny=warnings";
+            cargoClippyExtraArgs = "--all-targets -- --deny=warnings";
+          };
+
+          # cache keyed by Cargo.lock
+          crateArtifacts = craneLib.buildDepsOnly craneCommon;
+
+          crateClippy = craneLib.cargoClippy (
+            craneCommon // { cargoArtifacts = crateArtifacts; }
+          );
+          crate = craneLib.buildPackage (
+            craneCommon // { cargoArtifacts = crateArtifacts; }
+          );
 
           treefmt = pkgs.treefmt.withConfig {
             runtimeInputs = [
@@ -99,11 +104,9 @@
 
           formatter = treefmt;
 
-          checks = {
-            build = craneLib.buildPackage craneAttrs;
-            clippy = craneLib.cargoClippy craneAttrs;
-            test = craneLib.cargoTest craneAttrs;
-          };
+          checks = { inherit crate crateClippy; };
+
+          packages.default = crate;
 
           devShells.default = pkgs.mkShell {
             buildInputs = [
