@@ -25,7 +25,7 @@
 //!
 //! let subscriber = tracing_subscriber::registry()
 //!     .with(tracing_subscriber::fmt::layer())
-//!     .with(tracing_axiom::layer(axiom.evt_tx.clone()));
+//!     .with(tracing_axiom::layer(axiom.evt_tx.clone().downgrade()));
 //! tracing::subscriber::set_global_default(subscriber).unwrap();
 //!
 //! // Don't forget to deinit! Drop will panic!
@@ -291,9 +291,9 @@ impl<X: Send> Drop for Axiom<X> {
 }
 
 pub fn layer<X>(
-    evt_tx: tokio::sync::mpsc::Sender<Event<X>>,
+    evt_tx: tokio::sync::mpsc::WeakSender<Event<X>>,
 ) -> layer::Layer<X> {
-    layer::Layer::<X> { sender: evt_tx.downgrade() }
+    layer::Layer::<X> { sender: evt_tx }
 }
 
 #[derive(serde::Serialize)]

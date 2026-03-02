@@ -25,7 +25,7 @@ let axiom: tracing_axiom::Axiom =
 
 let subscriber = tracing_subscriber::registry()
     .with(tracing_subscriber::fmt::layer())
-    .with(tracing_axiom::layer(axiom.evt_tx.clone()));
+    .with(tracing_axiom::layer(axiom.evt_tx.clone().downgrade()));
 tracing::subscriber::set_global_default(subscriber).unwrap();
 
 // Don't forget to deinit! Drop will panic! (if not panicking already)
