@@ -42,7 +42,7 @@ async fn main() {
                 .parse_lossy(std::env::var("RUST_LOG").unwrap_or_default()),
         )
         .with(tracing_subscriber::fmt::layer())
-        .with(tracing_axiom::layer(axiom.evt_tx.clone()));
+        .with(tracing_axiom::layer(axiom.evt_tx.clone().downgrade()));
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
     async {
