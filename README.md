@@ -18,6 +18,7 @@ let axiom: tracing_axiom::Axiom =
         dataset: "example-dataset",
         collect_target: 4 << 10,
         collect_timeout: std::time::Duration::from_millis(500),
+        sender_pool_size: 1,
     });
 
 // NOTE: can clone `axiom.evt_tx` and send custom events to it as long as they
