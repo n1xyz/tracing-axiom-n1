@@ -32,6 +32,7 @@ async fn main() {
             dataset: "porting_test",
             collect_target: 4 << 10,
             collect_timeout: std::time::Duration::from_millis(500),
+            sender_pool_size: 1,
         });
 
     use tracing_subscriber::filter;
