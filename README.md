@@ -13,9 +13,9 @@ let axiom: tracing_axiom::Axiom =
     tracing_axiom::init(tracing_axiom::Config {
         evt_que_len: 4 << 10,
         service_name: "example-service",
-        base_url: "https://api.axiom.co".parse().unwrap(),
+        base_url: "https://us-east-1.aws.edge.axiom.co".parse().unwrap(),
         api_key: &api_key,
-        dataset: "example-dataset",
+        dataset_id: "example-dataset",
         collect_target: 4 << 10,
         collect_timeout: std::time::Duration::from_millis(500),
         sender_pool_size: 1,
