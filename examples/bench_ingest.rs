@@ -10,10 +10,10 @@ use tracing_subscriber::layer::SubscriberExt as _;
 struct Cli {
     #[arg(long)]
     api_key: String,
-    #[arg(long, default_value = "https://api.axiom.co")]
+    #[arg(long, default_value = "https://us-east-1.aws.edge.axiom.co")]
     base_url: String,
     #[arg(long)]
-    dataset: String,
+    dataset_id: String,
     #[arg(
         long,
         value_delimiter = ',',
@@ -71,7 +71,7 @@ fn main() {
                 "exec_order={:?} batches={} collect_target={} ",
                 "evt_que_len={} payload_bytes={}"
             ),
-            cli.dataset,
+            cli.dataset_id,
             cli.base_url,
             cli.pool_sizes,
             exec_order,
@@ -107,7 +107,7 @@ async fn run_phase(
         service_name: "bench-ingest",
         base_url,
         api_key: &opts.api_key,
-        dataset: &opts.dataset,
+        dataset_id: &opts.dataset_id,
         collect_target: opts.collect_target,
         collect_timeout: Duration::from_millis(opts.collect_timeout_ms),
         sender_pool_size: pool_size,

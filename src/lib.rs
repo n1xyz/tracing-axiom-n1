@@ -13,9 +13,9 @@
 //!     tracing_axiom::init(tracing_axiom::Config {
 //!         evt_que_len: 4 << 10,
 //!         service_name: "example-service",
-//!         base_url: "https://api.axiom.co".parse().unwrap(),
+//!         base_url: "https://us-east-1.aws.edge.axiom.co".parse().unwrap(),
 //!         api_key: &api_key,
-//!         dataset: "example-dataset",
+//!         dataset_id: "example-dataset",
 //!         collect_target: 4 << 10,
 //!         collect_timeout: std::time::Duration::from_millis(500),
 //!         sender_pool_size: 1,
@@ -46,7 +46,7 @@ pub mod layer;
 pub struct Config<'a> {
     pub api_key: &'a str,
     pub base_url: reqwest::Url,
-    pub dataset: &'a str,
+    pub dataset_id: &'a str,
     /// Event queue length. Will start dropping events once this is full
     pub evt_que_len: usize,
     pub service_name: &'static str,
@@ -80,7 +80,7 @@ where
     //       parsing is deterministic and config shouldn't be dynamic
     let ingest_url = cfg
         .base_url
-        .join(&format!("v1/datasets/{}/ingest", cfg.dataset))
+        .join(&format!("v1/ingest/{}", cfg.dataset_id))
         .unwrap();
     let bearer = reqwest::header::HeaderValue::try_from(
         format!("Bearer {}", cfg.api_key), //.
@@ -298,7 +298,7 @@ impl From<tracing::Level> for Level {
     }
 }
 
-// https://axiom.co/docs/restapi/endpoints/ingestIntoDataset
+// https://axiom.co/docs/restapi/endpoints/ingestToDataset
 #[allow(dead_code)]
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -857,7 +857,7 @@ mod tests {
                 obs: Arc::new(Mutex::new(ServerObs::default())),
             };
             let app = Router::new()
-                .route("/v1/datasets/test/ingest", post(ingest))
+                .route("/v1/ingest/test", post(ingest))
                 .with_state(stub.clone());
             let listener = tokio::net::TcpListener::bind(SocketAddr::from((
                 [127, 0, 0, 1],
@@ -890,7 +890,7 @@ mod tests {
                 service_name: "test-service",
                 base_url: format!("http://{}", self.addr).parse().unwrap(),
                 api_key: "test-key",
-                dataset: "test",
+                dataset_id: "test",
                 collect_target,
                 collect_timeout: Duration::from_secs(30),
                 sender_pool_size,
