@@ -43,6 +43,8 @@ use tracing::instrument::WithSubscriber as _;
 
 pub mod layer;
 
+pub(crate) const INTERNAL_TARGET: &str = "tracing_axiom::internal";
+
 pub struct Config<'a> {
     pub api_key: &'a str,
     pub base_url: reqwest::Url,
@@ -78,10 +80,8 @@ where
     // NOTE: too much effort to bubble error here. this is run once on app init
     //       so this is fine. spurious crashlooping is impossible as the
     //       parsing is deterministic and config shouldn't be dynamic
-    let ingest_url = cfg
-        .base_url
-        .join(&format!("v1/ingest/{}", cfg.dataset_id))
-        .unwrap();
+    let ingest_url =
+        cfg.base_url.join(&format!("v1/ingest/{}", cfg.dataset_id)).unwrap();
     let bearer = reqwest::header::HeaderValue::try_from(
         format!("Bearer {}", cfg.api_key), //.
     )
@@ -129,10 +129,11 @@ where
             }),
         );
 
-        let ((), _senders) = tokio::join!(coord, senders);
+        let ((), _senders) = futures_util::join!(coord, senders);
     };
-    let bg_handle =
-        rt.spawn(bg_task.with_subscriber(tracing_core::Dispatch::none()));
+    // Carry the caller's current dispatch onto the spawned bg task so its
+    // internal logs still reach the app's other tracing layers.
+    let bg_handle = rt.spawn(bg_task.with_current_subscriber());
 
     Axiom { evt_tx: evt_tx.clone(), bg_handle: Some(bg_handle) }
 }
@@ -252,6 +253,27 @@ pub enum Event<Extra = Never> {
         kind: BogusKind,
     },
     Extra(Extra),
+}
+
+impl<Extra: serde::Serialize> std::fmt::Debug for Event<Extra> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        struct FmtIo<'a, 'b>(&'a mut std::fmt::Formatter<'b>);
+
+        impl std::io::Write for FmtIo<'_, '_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let s =
+                    std::str::from_utf8(buf).map_err(std::io::Error::other)?;
+                self.0.write_str(s).map_err(std::io::Error::other)?;
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        serde_json::to_writer(FmtIo(f), self).map_err(|_| std::fmt::Error)
+    }
 }
 
 /// Axiom absolutely wants this for trace/span recognition so here it is.
@@ -551,10 +573,8 @@ async fn coord_task<X>(
                     let read = evt_rx.recv_many(&mut evts_buf, rest).await;
                     assert_eq!(read, evts_buf.len());
                     if read == 0 {
-                        if evts_count == 0 {
-                            if evts_buf.is_empty() {
-                                return Break(());
-                            }
+                        if evts_count == 0 && evts_buf.is_empty() {
+                            return Break(());
                         }
                         return Continue(());
                     }
@@ -638,6 +658,7 @@ async fn send_blob(
                     serde_json::from_slice(&status_raw).unwrap();
                 if status.failed > 0 || !status.failures.is_empty() {
                     tracing::error!(
+                        target: INTERNAL_TARGET,
                         ?backoff,
                         attempt = i,
                         status=?status_raw,
@@ -651,6 +672,7 @@ async fn send_blob(
             }
             Err(err) => {
                 tracing::error!(
+                    target: INTERNAL_TARGET,
                     ?backoff,
                     attempt = i,
                     ?err,
@@ -664,6 +686,7 @@ async fn send_blob(
     }
     if reached_max_retry {
         tracing::error!(
+            target: INTERNAL_TARGET,
             max_retries = MAX_RETRIES,
             evts_count = blob.evts_count,
             "reached max retries for ingest batch. dropping events!"
