@@ -123,13 +123,27 @@ where
             cfg.collect_timeout,
             cfg.service_name,
         );
-        let senders = futures_util::future::join_all(
-            slots.iter().enumerate().map(|(id, slot)| {
-                sender_task(id, slot, &idle_tx, &client, &ingest_url, &bearer)
-            }),
-        );
+        let senders = slots
+            .iter()
+            .enumerate()
+            .map(|(id, slot)| SenderFut {
+                done: false,
+                fut: sender_task(
+                    id,
+                    slot,
+                    &idle_tx,
+                    &client,
+                    &ingest_url,
+                    &bearer,
+                ),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let mut senders = Box::into_pin(senders);
+        let senders =
+            std::future::poll_fn(|cx| poll_senders(senders.as_mut(), cx));
 
-        let ((), _senders) = futures_util::join!(coord, senders);
+        let ((), ()) = tokio::join!(coord, senders);
     };
     // Carry the caller's current dispatch onto the spawned bg task so its
     // internal logs still reach the app's other tracing layers.
@@ -506,6 +520,38 @@ struct BatchBlob {
     evts_count: usize,
 }
 
+struct SenderFut<F> {
+    done: bool,
+    fut: F,
+}
+
+fn poll_senders<F>(
+    mut senders: std::pin::Pin<&mut [SenderFut<F>]>,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<()>
+where
+    F: std::future::Future<Output = ()>,
+{
+    let mut pending = false;
+
+    // SAFETY:
+    // `senders` is pinned once as a boxed slice and never moved again.
+    // We never reorder or replace elems, and only poll each future in place.
+    for sender in unsafe { senders.as_mut().get_unchecked_mut() }.iter_mut() {
+        if sender.done {
+            continue;
+        }
+
+        match unsafe { std::pin::Pin::new_unchecked(&mut sender.fut) }.poll(cx)
+        {
+            std::task::Poll::Ready(()) => sender.done = true,
+            std::task::Poll::Pending => pending = true,
+        }
+    }
+
+    if pending { std::task::Poll::Pending } else { std::task::Poll::Ready(()) }
+}
+
 async fn sender_task(
     id: usize,
     slot: &SenderSlot,
@@ -581,10 +627,13 @@ async fn coord_task<X>(
                     rest -= read;
                     evts_count += read;
                     for evt in &evts_buf {
-                        serde_json::to_writer(&mut encoder, &EventWrapper {
-                            service: EventService { name: service_name },
-                            event: evt,
-                        })
+                        serde_json::to_writer(
+                            &mut encoder,
+                            &EventWrapper {
+                                service: EventService { name: service_name },
+                                event: evt,
+                            },
+                        )
                         .unwrap();
                         encoder.write_all(b"\n").unwrap();
                     }
