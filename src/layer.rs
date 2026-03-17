@@ -133,54 +133,31 @@ impl<X: serde::Serialize> Layer<X> {
         //       so that channel can be explicitly closed instead of
         //       relying solely on tx count.
         let Some(sender) = self.sender.upgrade() else {
-            fake_log_field(
-                "ERROR: queue closed. dropping event.",
-                "event",
-                &evt,
+            tracing::error!(
+                target: crate::INTERNAL_TARGET,
+                event = ?evt,
+                "queue closed. dropping event"
             );
             return;
         };
         match sender.try_send(evt) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Closed(e)) => {
-                fake_log_field(
-                    "ERROR: queue closed. dropping event.",
-                    "event",
-                    &e,
+                tracing::error!(
+                    target: crate::INTERNAL_TARGET,
+                    event = ?e,
+                    "queue closed. dropping event"
                 );
             }
             Err(mpsc::error::TrySendError::Full(e)) => {
-                fake_log_field(
-                    "ERROR: queue full. dropping event.",
-                    "event",
-                    &e,
+                tracing::error!(
+                    target: crate::INTERNAL_TARGET,
+                    event = ?e,
+                    "queue full. dropping event"
                 );
             }
         }
     }
-}
-
-fn fake_log_prefix(stderr: &mut impl std::io::Write, msg: &str) {
-    time::OffsetDateTime::now_utc()
-        .format_into(
-            &mut *stderr,
-            &time::format_description::well_known::Rfc3339,
-        )
-        .unwrap();
-    write!(&mut *stderr, " {}", msg).unwrap();
-}
-pub(crate) fn fake_log_field(
-    msg: &str,
-    k: &'static str,
-    v: &impl serde::Serialize,
-) {
-    use std::io::Write as _;
-    let mut stderr = std::io::stderr();
-
-    fake_log_prefix(&mut stderr, msg);
-    write!(&mut stderr, " {k}=").unwrap();
-    serde_json::ser::to_writer(&mut stderr, v).unwrap();
-    writeln!(&mut stderr).unwrap();
 }
 
 thread_local! {
@@ -303,6 +280,12 @@ impl<X: serde::Serialize + 'static, S: Subscriber + for<'a> LookupSpan<'a>>
         event: &tracing::Event<'_>,
         ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
+        // Internal ingest-task logs should go to the app's other tracing layers
+        // but must never be re-enqueued back into Axiom, or we'd recurse.
+        if event.metadata().target().starts_with(crate::INTERNAL_TARGET) {
+            return;
+        }
+
         let span = ctx.event_span(event);
 
         let (parent_span_id, trace_id, s_fields) = match span.and_then(|p| {
