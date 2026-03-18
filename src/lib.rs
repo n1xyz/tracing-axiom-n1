@@ -627,13 +627,10 @@ async fn coord_task<X>(
                     rest -= read;
                     evts_count += read;
                     for evt in &evts_buf {
-                        serde_json::to_writer(
-                            &mut encoder,
-                            &EventWrapper {
-                                service: EventService { name: service_name },
-                                event: evt,
-                            },
-                        )
+                        serde_json::to_writer(&mut encoder, &EventWrapper {
+                            service: EventService { name: service_name },
+                            event: evt,
+                        })
                         .unwrap();
                         encoder.write_all(b"\n").unwrap();
                     }
@@ -687,8 +684,18 @@ async fn send_blob(
     bearer: &reqwest::header::HeaderValue,
     blob: BatchBlob,
 ) {
-    let mut backoff = std::time::Duration::from_millis(500);
+    // NOTE: this backoff is quite long. we currently bias this library to
+    // mainly if ever dropping events, doing so at the back of a full queue
+    // to allow for the queue to soften intermittent isues.
+    //
+    // for this reason we try to hold on to events and retry for a long time
+    // here.
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
+    let mut backoff = std::time::Duration::from_millis(200);
     let mut reached_max_retry = true;
+    // NOTE: to avoid spamming logs and causing data loss due to truncation, we
+    // only print the first of a repeated sequence of errors of each type.
+    let mut last_err_is_transport = None;
     const MAX_RETRIES: u16 = 100;
     for i in 0..MAX_RETRIES {
         let res = client
@@ -706,32 +713,56 @@ async fn send_blob(
                 let status: IngestStatus =
                     serde_json::from_slice(&status_raw).unwrap();
                 if status.failed > 0 || !status.failures.is_empty() {
-                    tracing::error!(
-                        target: INTERNAL_TARGET,
-                        ?backoff,
-                        attempt = i,
-                        status=?status_raw,
-                        evts_count = blob.evts_count,
-                        "axiom reported ingest failures"
-                    );
+                    if last_err_is_transport.unwrap_or(true) {
+                        tracing::error!(
+                            target: INTERNAL_TARGET,
+                            ?backoff,
+                            attempt = i,
+                            status=?status_raw,
+                            evts_count = blob.evts_count,
+                            "axiom reported ingest failures"
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: INTERNAL_TARGET,
+                            ?backoff,
+                            attempt = i,
+                            status=?status_raw,
+                            evts_count = blob.evts_count,
+                            "axiom reported ingest failures"
+                        );
+                    }
+                    last_err_is_transport = Some(false);
                 } else {
                     reached_max_retry = false;
                     break;
                 }
             }
             Err(err) => {
-                tracing::error!(
-                    target: INTERNAL_TARGET,
-                    ?backoff,
-                    attempt = i,
-                    ?err,
-                    evts_count = blob.evts_count,
-                    "axiom request failed"
-                );
+                if !last_err_is_transport.unwrap_or(false) {
+                    tracing::error!(
+                        target: INTERNAL_TARGET,
+                        ?backoff,
+                        attempt = i,
+                        ?err,
+                        evts_count = blob.evts_count,
+                        "axiom request failed"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: INTERNAL_TARGET,
+                        ?backoff,
+                        attempt = i,
+                        ?err,
+                        evts_count = blob.evts_count,
+                        "axiom request failed"
+                    );
+                }
+                last_err_is_transport = Some(true);
             }
         }
         tokio::time::sleep(backoff).await;
-        backoff = backoff.mul_f32(1.5);
+        backoff = backoff.mul_f32(1.5).min(MAX_BACKOFF);
     }
     if reached_max_retry {
         tracing::error!(
