@@ -868,7 +868,7 @@ where
         buf[i * 2 + 1] = chr(b % 16);
     }
 
-    serializer.serialize_str(unsafe { str::from_utf8_unchecked(&buf) })
+    serializer.serialize_str(unsafe { str::from_utf8_unchecked(&buf[..N * 2]) })
 }
 fn ser_opt_hex<const N: usize, S>(
     bytes: &Option<[u8; N]>,
