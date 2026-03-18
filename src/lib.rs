@@ -71,9 +71,9 @@ pub fn init<X>(cfg: Config) -> Axiom<X>
 where
     X: serde::Serialize + std::marker::Send + 'static,
 {
-    if cfg.sender_pool_size == 0 {
-        panic!("sender_pool_size must be > 0");
-    }
+    assert!(cfg.evt_que_len > 0, "evt_que_len must be > 0");
+    assert!(cfg.collect_target > 0, "collect_target must be > 0");
+    assert!(cfg.sender_pool_size > 0, "sender_pool_size must be > 0");
 
     let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel(cfg.evt_que_len);
 
@@ -594,14 +594,19 @@ async fn coord_task<X>(
     X: serde::Serialize + Send + 'static,
 {
     use std::io::Write as _;
-    use std::ops::ControlFlow::{Break, Continue};
 
     use bytes::BufMut as _;
+
+    enum BatchCtl {
+        Continue,
+        DropBatch,
+        Shutdown,
+    }
 
     let mut zstd_ctx = zstd::zstd_safe::CCtx::try_create().unwrap();
     let mut body = bytes::BytesMut::with_capacity(2048);
     let mut evts_buf = Vec::with_capacity(collect_target);
-    loop {
+    'batch: loop {
         let mut evts_count = 0;
 
         body.clear();
@@ -620,30 +625,57 @@ async fn coord_task<X>(
                     assert_eq!(read, evts_buf.len());
                     if read == 0 {
                         if evts_count == 0 && evts_buf.is_empty() {
-                            return Break(());
+                            return BatchCtl::Shutdown;
                         }
-                        return Continue(());
+                        return BatchCtl::Continue;
                     }
                     rest -= read;
                     evts_count += read;
                     for evt in &evts_buf {
-                        serde_json::to_writer(&mut encoder, &EventWrapper {
-                            service: EventService { name: service_name },
-                            event: evt,
-                        })
-                        .unwrap();
-                        encoder.write_all(b"\n").unwrap();
+                        if let Err(err) = serde_json::to_writer(
+                            &mut encoder,
+                            &EventWrapper {
+                                service: EventService { name: service_name },
+                                event: evt,
+                            },
+                        ) {
+                            tracing::error!(
+                                target: INTERNAL_TARGET,
+                                ?err,
+                                evts_count,
+                                "failed to encode event batch. dropping batch"
+                            );
+                            return BatchCtl::DropBatch;
+                        }
+                        if let Err(err) = encoder.write_all(b"\n") {
+                            tracing::error!(
+                                target: INTERNAL_TARGET,
+                                ?err,
+                                evts_count,
+                                "failed to encode event batch. dropping batch"
+                            );
+                            return BatchCtl::DropBatch;
+                        }
                     }
                 }
-                Continue(())
+                BatchCtl::Continue
             })
             .await
             {
-                Ok(Break(())) => {
+                Ok(BatchCtl::Shutdown) => {
                     close_slots(slots).await;
                     return;
                 }
-                Ok(Continue(())) | Err(tokio::time::error::Elapsed { .. }) => {}
+                Ok(BatchCtl::DropBatch) => {
+                    drop(encoder);
+                    body = body_writer.into_inner();
+                    zstd_ctx
+                        .reset(zstd::zstd_safe::ResetDirective::SessionOnly)
+                        .unwrap();
+                    continue 'batch;
+                }
+                Ok(BatchCtl::Continue)
+                | Err(tokio::time::error::Elapsed { .. }) => {}
             };
         }
         assert!(evts_count > 0);
@@ -684,19 +716,44 @@ async fn send_blob(
     bearer: &reqwest::header::HeaderValue,
     blob: BatchBlob,
 ) {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum RetryErrKind {
+        Transport,
+        HttpStatus(reqwest::StatusCode),
+        RespBodyRead,
+        RespBodyParse,
+        IngestFailed,
+    }
+    enum SendCtl {
+        Done,
+        Retry,
+    }
+
     // NOTE: this backoff is quite long. we currently bias this library to
     // mainly if ever dropping events, doing so at the back of a full queue
     // to allow for the queue to soften intermittent isues.
     //
     // for this reason we try to hold on to events and retry for a long time
     // here.
+    const BACKOFF_MULT: f32 = 1.5;
     const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
     let mut backoff = std::time::Duration::from_millis(200);
-    let mut reached_max_retry = true;
     // NOTE: to avoid spamming logs and causing data loss due to truncation, we
-    // only print the first of a repeated sequence of errors of each type.
-    let mut last_err_is_transport = None;
+    // only print the first of a repeated sequence of the same retry error.
+    let mut last_err_kind = None;
+    macro_rules! log_retry {
+        ($kind:expr, $($arg:tt)*) => {{
+            let kind = $kind;
+            if last_err_kind == Some(kind) {
+                tracing::debug!($($arg)*);
+            } else {
+                tracing::error!($($arg)*);
+            }
+            last_err_kind = Some(kind);
+        }};
+    }
     const MAX_RETRIES: u16 = 100;
+    let mut ctl = SendCtl::Retry;
     for i in 0..MAX_RETRIES {
         let res = client
             .post(ingest_url.clone())
@@ -707,64 +764,80 @@ async fn send_blob(
             .send()
             .await
             .and_then(|resp| resp.error_for_status());
-        match res {
-            Ok(resp) => {
-                let status_raw = resp.bytes().await.unwrap();
-                let status: IngestStatus =
-                    serde_json::from_slice(&status_raw).unwrap();
-                if status.failed > 0 || !status.failures.is_empty() {
-                    if last_err_is_transport.unwrap_or(true) {
-                        tracing::error!(
-                            target: INTERNAL_TARGET,
-                            ?backoff,
-                            attempt = i,
-                            status=?status_raw,
-                            evts_count = blob.evts_count,
-                            "axiom reported ingest failures"
-                        );
-                    } else {
-                        tracing::warn!(
-                            target: INTERNAL_TARGET,
-                            ?backoff,
-                            attempt = i,
-                            status=?status_raw,
-                            evts_count = blob.evts_count,
-                            "axiom reported ingest failures"
-                        );
+        ctl = match res {
+            Ok(resp) => match resp.bytes().await {
+                Ok(status_raw) => {
+                    match serde_json::from_slice::<IngestStatus>(&status_raw) {
+                        Ok(status) => {
+                            if status.failed > 0 || !status.failures.is_empty()
+                            {
+                                log_retry!(
+                                    RetryErrKind::IngestFailed,
+                                    target: INTERNAL_TARGET,
+                                    ?backoff,
+                                    attempt = i,
+                                    status=?status_raw,
+                                    evts_count = blob.evts_count,
+                                    "axiom reported ingest failures"
+                                );
+                                SendCtl::Retry
+                            } else {
+                                SendCtl::Done
+                            }
+                        }
+                        Err(err) => {
+                            log_retry!(
+                                RetryErrKind::RespBodyParse,
+                                target: INTERNAL_TARGET,
+                                ?backoff,
+                                attempt = i,
+                                ?err,
+                                status = ?status_raw,
+                                evts_count = blob.evts_count,
+                                "failed to parse ingest response body"
+                            );
+                            SendCtl::Retry
+                        }
                     }
-                    last_err_is_transport = Some(false);
-                } else {
-                    reached_max_retry = false;
-                    break;
                 }
-            }
+                Err(err) => {
+                    log_retry!(
+                        RetryErrKind::RespBodyRead,
+                        target: INTERNAL_TARGET,
+                        ?backoff,
+                        attempt = i,
+                        ?err,
+                        evts_count = blob.evts_count,
+                        "failed to read ingest response body"
+                    );
+                    SendCtl::Retry
+                }
+            },
             Err(err) => {
-                if !last_err_is_transport.unwrap_or(false) {
-                    tracing::error!(
-                        target: INTERNAL_TARGET,
-                        ?backoff,
-                        attempt = i,
-                        ?err,
-                        evts_count = blob.evts_count,
-                        "axiom request failed"
-                    );
-                } else {
-                    tracing::debug!(
-                        target: INTERNAL_TARGET,
-                        ?backoff,
-                        attempt = i,
-                        ?err,
-                        evts_count = blob.evts_count,
-                        "axiom request failed"
-                    );
-                }
-                last_err_is_transport = Some(true);
+                log_retry!(
+                    match err.status() {
+                        Some(status) => RetryErrKind::HttpStatus(status),
+                        None => RetryErrKind::Transport,
+                    },
+                    target: INTERNAL_TARGET,
+                    ?backoff,
+                    attempt = i,
+                    ?err,
+                    evts_count = blob.evts_count,
+                    "axiom request failed"
+                );
+                SendCtl::Retry
+            }
+        };
+        match ctl {
+            SendCtl::Done => break,
+            SendCtl::Retry => {
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.mul_f32(BACKOFF_MULT).min(MAX_BACKOFF);
             }
         }
-        tokio::time::sleep(backoff).await;
-        backoff = backoff.mul_f32(1.5).min(MAX_BACKOFF);
     }
-    if reached_max_retry {
+    if matches!(ctl, SendCtl::Retry) {
         tracing::error!(
             target: INTERNAL_TARGET,
             max_retries = MAX_RETRIES,
@@ -813,7 +886,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::VecDeque,
         net::SocketAddr,
         sync::{Arc, Mutex},
         time::Duration,
@@ -830,10 +903,17 @@ mod tests {
 
     use super::{Config, Event, init};
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     struct ServerCfg {
         delay: Duration,
-        fail_first_batch_once: bool,
+        resps: Vec<StubResp>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum StubResp {
+        Ok,
+        Http500,
+        OkBadJson,
     }
 
     #[derive(Clone, Debug)]
@@ -851,8 +931,6 @@ mod tests {
 
     #[derive(Default)]
     struct ServerObs {
-        /// Per-request attempt count for the retry test.
-        attempts: HashMap<u64, usize>,
         /// Request log in arrival order.
         reqs: Vec<ReqObs>,
         /// Current concurrent requests inside the stub server.
@@ -865,6 +943,8 @@ mod tests {
     struct StubServer {
         /// Static behavior knobs for this server instance.
         cfg: ServerCfg,
+        /// Scripted response sequence for this server instance.
+        resps: Arc<Mutex<VecDeque<StubResp>>>,
         /// Mutable observations shared with the tests.
         obs: Arc<Mutex<ServerObs>>,
     }
@@ -906,18 +986,13 @@ mod tests {
         ReqObs { start_seq: start_seq.unwrap(), evts }
     }
 
-    fn record_req(stub: &StubServer, req: &ReqObs) -> bool {
+    fn record_req(stub: &StubServer, req: &ReqObs) -> StubResp {
         let mut obs = stub.obs.lock().unwrap();
         obs.in_flight += 1;
         obs.max_in_flight = obs.max_in_flight.max(obs.in_flight);
         obs.reqs.push(req.clone());
-
-        let attempt = obs.attempts.entry(req.start_seq).or_insert(0);
-        let should_fail = stub.cfg.fail_first_batch_once
-            && req.start_seq == 0
-            && *attempt == 0;
-        *attempt += 1;
-        should_fail
+        drop(obs);
+        stub.resps.lock().unwrap().pop_front().unwrap_or(StubResp::Ok)
     }
 
     fn ingest_ok(evts: usize) -> impl IntoResponse {
@@ -937,7 +1012,7 @@ mod tests {
     ) -> impl IntoResponse {
         let req =
             decode_req(to_bytes(req.into_body(), usize::MAX).await.unwrap());
-        let should_fail = record_req(&stub, &req);
+        let resp = record_req(&stub, &req);
 
         if stub.cfg.delay > Duration::ZERO {
             tokio::time::sleep(stub.cfg.delay).await;
@@ -945,17 +1020,27 @@ mod tests {
 
         stub.obs.lock().unwrap().in_flight -= 1;
 
-        let status = if should_fail {
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR
-        } else {
-            axum::http::StatusCode::OK
-        };
-        (status, ingest_ok(req.evts))
+        match resp {
+            StubResp::Ok => (
+                axum::http::StatusCode::OK,
+                ingest_ok(req.evts).into_response(),
+            ),
+            StubResp::Http500 => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                ingest_ok(req.evts).into_response(),
+            ),
+            StubResp::OkBadJson => {
+                (axum::http::StatusCode::OK, "nope".into_response())
+            }
+        }
     }
 
     impl TestServer {
         async fn new(cfg: ServerCfg) -> Self {
             let stub = StubServer {
+                resps: Arc::new(Mutex::new(
+                    cfg.resps.iter().copied().collect(),
+                )),
                 cfg,
                 obs: Arc::new(Mutex::new(ServerObs::default())),
             };
@@ -1020,7 +1105,7 @@ mod tests {
     async fn ingest_sender_pool_1_preserves_request_order() {
         let srv = TestServer::new(ServerCfg {
             delay: Duration::from_millis(50),
-            fail_first_batch_once: false,
+            resps: vec![],
         })
         .await;
         let axiom = srv.mk_axiom(8, 2, 1);
@@ -1037,7 +1122,7 @@ mod tests {
     async fn ingest_sender_pool_gt_1_allows_concurrent_sends() {
         let srv = TestServer::new(ServerCfg {
             delay: Duration::from_millis(150),
-            fail_first_batch_once: false,
+            resps: vec![],
         })
         .await;
         let axiom = srv.mk_axiom(8, 1, 2);
@@ -1052,7 +1137,7 @@ mod tests {
     async fn ingest_full_sender_pool_pushes_backpressure_upstream() {
         let srv = TestServer::new(ServerCfg {
             delay: Duration::from_millis(250),
-            fail_first_batch_once: false,
+            resps: vec![],
         })
         .await;
         let axiom = srv.mk_axiom(1, 1, 1);
@@ -1077,7 +1162,7 @@ mod tests {
     async fn ingest_retry_holds_sender_slot() {
         let srv = TestServer::new(ServerCfg {
             delay: Duration::ZERO,
-            fail_first_batch_once: true,
+            resps: vec![StubResp::Http500],
         })
         .await;
         let axiom = srv.mk_axiom(8, 1, 1);
@@ -1092,12 +1177,76 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ingest_shutdown_flushes_partial_batch() {
+    async fn ingest_retries_malformed_success_body() {
         let srv = TestServer::new(ServerCfg {
             delay: Duration::ZERO,
-            fail_first_batch_once: false,
+            resps: vec![StubResp::OkBadJson],
         })
         .await;
+        let axiom = srv.mk_axiom(8, 1, 1);
+
+        send_evts(&axiom, 1).await;
+        let obs = srv.finish(axiom).await;
+
+        assert_eq!(obs.reqs.len(), 2);
+        assert_eq!(obs.reqs[0].start_seq, 0);
+        assert_eq!(obs.reqs[1].start_seq, 0);
+    }
+
+    #[derive(Clone, Copy)]
+    enum MaybeBadEvt {
+        Good(u64),
+        Bad,
+    }
+
+    impl serde::Serialize for MaybeBadEvt {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            match self {
+                Self::Good(seq) => TestEvt { seq: *seq }.serialize(serializer),
+                Self::Bad => Err(serde::ser::Error::custom("boom")),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ingest_drops_bad_batch_and_keeps_running() {
+        let srv =
+            TestServer::new(ServerCfg { delay: Duration::ZERO, resps: vec![] })
+                .await;
+        let axiom = init(Config {
+            evt_que_len: 8,
+            service_name: "test-service",
+            base_url: format!("http://{}", srv.addr).parse().unwrap(),
+            api_key: "test-key",
+            dataset_id: "test",
+            collect_target: 2,
+            collect_timeout: Duration::from_secs(30),
+            sender_pool_size: 1,
+        });
+
+        axiom.evt_tx.send(Event::Extra(MaybeBadEvt::Good(0))).await.unwrap();
+        axiom.evt_tx.send(Event::Extra(MaybeBadEvt::Bad)).await.unwrap();
+        axiom.evt_tx.send(Event::Extra(MaybeBadEvt::Good(2))).await.unwrap();
+        axiom.evt_tx.send(Event::Extra(MaybeBadEvt::Good(3))).await.unwrap();
+        axiom.deinit().await;
+
+        let _ = srv.shutdown_tx.send(());
+        srv.server.await.unwrap();
+        let obs = srv.stub.obs.lock().unwrap();
+
+        assert_eq!(obs.reqs.len(), 1);
+        assert_eq!(obs.reqs[0].start_seq, 2);
+        assert_eq!(obs.reqs[0].evts, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ingest_shutdown_flushes_partial_batch() {
+        let srv =
+            TestServer::new(ServerCfg { delay: Duration::ZERO, resps: vec![] })
+                .await;
         let axiom = srv.mk_axiom(8, 4, 1);
 
         send_evts(&axiom, 3).await;
