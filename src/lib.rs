@@ -39,7 +39,6 @@
 use std::borrow::Cow;
 
 pub use reqwest::Url;
-use tracing::instrument::WithSubscriber as _;
 
 pub mod layer;
 
@@ -145,9 +144,11 @@ where
 
         let ((), ()) = tokio::join!(coord, senders);
     };
-    // Carry the caller's current dispatch onto the spawned bg task so its
-    // internal logs still reach the app's other tracing layers.
-    let bg_handle = rt.spawn(bg_task.with_current_subscriber());
+    // NOTE: don't capture the caller's current dispatch here. In telm the
+    // global subscriber is installed after `init()`, so freezing the current
+    // dispatch would pin this bg task to the pre-init no-op subscriber and
+    // hide its internal logs from stderr/journal forever.
+    let bg_handle = rt.spawn(bg_task);
 
     Axiom { evt_tx: evt_tx.clone(), bg_handle: Some(bg_handle) }
 }
