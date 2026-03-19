@@ -789,31 +789,27 @@ async fn send_blob(
                             }
                         }
                         Err(err) => {
-                            log_retry!(
-                                RetryErrKind::RespBodyParse,
+                            tracing::error!(
                                 target: INTERNAL_TARGET,
-                                ?backoff,
                                 attempt = attempts - 1,
                                 ?err,
                                 status = ?status_raw,
                                 evts_count = blob.evts_count,
-                                "failed to parse ingest response body"
+                                "failed to parse ingest response body. dropping blob"
                             );
-                            SendCtl::Retry
+                            SendCtl::Done
                         }
                     }
                 }
                 Err(err) => {
-                    log_retry!(
-                        RetryErrKind::RespBodyRead,
+                    tracing::error!(
                         target: INTERNAL_TARGET,
-                        ?backoff,
                         attempt = attempts - 1,
                         ?err,
                         evts_count = blob.evts_count,
-                        "failed to read ingest response body"
+                        "failed to read ingest response body. dropping blob"
                     );
-                    SendCtl::Retry
+                    SendCtl::Done
                 }
             },
             Err(err) => {
