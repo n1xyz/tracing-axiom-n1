@@ -70,6 +70,18 @@ pub fn init<X>(cfg: Config) -> Axiom<X>
 where
     X: serde::Serialize + std::marker::Send + 'static,
 {
+    // NOTE: mirror axiom-go's default client timeouts.
+    // Total timeout:
+    // https://github.com/axiomhq/axiom-go/blob/05ab863353532f691e2e46d72008d39897de3b6c/axiom/client.go#L61
+    // Transport timeouts:
+    // https://github.com/axiomhq/axiom-go/blob/05ab863353532f691e2e46d72008d39897de3b6c/axiom/client.go#L67
+    const TIMEOUT_REQ: std::time::Duration =
+        std::time::Duration::from_secs(300);
+    const TIMEOUT_CONNECT: std::time::Duration =
+        std::time::Duration::from_secs(30);
+    const TIMEOUT_READ: std::time::Duration =
+        std::time::Duration::from_secs(120);
+
     assert!(cfg.evt_que_len > 0, "evt_que_len must be > 0");
     assert!(cfg.collect_target > 0, "collect_target must be > 0");
     assert!(cfg.sender_pool_size > 0, "sender_pool_size must be > 0");
@@ -86,6 +98,9 @@ where
     )
     .unwrap();
     let client = reqwest::Client::builder()
+        .timeout(TIMEOUT_REQ)
+        .connect_timeout(TIMEOUT_CONNECT)
+        .read_timeout(TIMEOUT_READ)
         .user_agent(concat!(
             env!("CARGO_PKG_NAME"),
             "/",
