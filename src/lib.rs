@@ -730,15 +730,17 @@ async fn send_blob(
         Retry,
     }
 
-    // NOTE: this backoff is quite long. we currently bias this library to
-    // mainly if ever dropping events, doing so at the back of a full queue
-    // to allow for the queue to soften intermittent isues.
-    //
-    // for this reason we try to hold on to events and retry for a long time
-    // here.
+    // Mostly mirroring axiom-go's retry cfg and 5xx-only HTTP retry policy.
+    // Docs: https://pkg.go.dev/github.com/axiomhq/axiom-go/axiom
+    // Src: https://github.com/axiomhq/axiom-go/blob/main/axiom/client.go#L259
+    const INITIAL_BACKOFF: std::time::Duration =
+        std::time::Duration::from_millis(200);
+    const MAX_RETRY_ELAPSED: std::time::Duration =
+        std::time::Duration::from_secs(10);
     const BACKOFF_MULT: f32 = 1.5;
-    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
-    let mut backoff = std::time::Duration::from_millis(200);
+
+    let retry_start = tokio::time::Instant::now();
+    let mut backoff = INITIAL_BACKOFF;
     // NOTE: to avoid spamming logs and causing data loss due to truncation, we
     // only print the first of a repeated sequence of the same retry error.
     let mut last_err_kind = None;
@@ -753,9 +755,9 @@ async fn send_blob(
             last_err_kind = Some(kind);
         }};
     }
-    const MAX_RETRIES: u16 = 100;
-    let mut ctl = SendCtl::Retry;
-    for i in 0..MAX_RETRIES {
+    let mut attempts = 0u16;
+    let ctl = loop {
+        attempts += 1;
         let res = client
             .post(ingest_url.clone())
             .header(reqwest::header::AUTHORIZATION, bearer)
@@ -765,7 +767,7 @@ async fn send_blob(
             .send()
             .await
             .and_then(|resp| resp.error_for_status());
-        ctl = match res {
+        let ctl = match res {
             Ok(resp) => match resp.bytes().await {
                 Ok(status_raw) => {
                     match serde_json::from_slice::<IngestStatus>(&status_raw) {
@@ -776,7 +778,7 @@ async fn send_blob(
                                     RetryErrKind::IngestFailed,
                                     target: INTERNAL_TARGET,
                                     ?backoff,
-                                    attempt = i,
+                                    attempt = attempts - 1,
                                     status=?status_raw,
                                     evts_count = blob.evts_count,
                                     "axiom reported ingest failures"
@@ -791,7 +793,7 @@ async fn send_blob(
                                 RetryErrKind::RespBodyParse,
                                 target: INTERNAL_TARGET,
                                 ?backoff,
-                                attempt = i,
+                                attempt = attempts - 1,
                                 ?err,
                                 status = ?status_raw,
                                 evts_count = blob.evts_count,
@@ -806,7 +808,7 @@ async fn send_blob(
                         RetryErrKind::RespBodyRead,
                         target: INTERNAL_TARGET,
                         ?backoff,
-                        attempt = i,
+                        attempt = attempts - 1,
                         ?err,
                         evts_count = blob.evts_count,
                         "failed to read ingest response body"
@@ -815,35 +817,66 @@ async fn send_blob(
                 }
             },
             Err(err) => {
-                log_retry!(
-                    match err.status() {
-                        Some(status) => RetryErrKind::HttpStatus(status),
-                        None => RetryErrKind::Transport,
-                    },
-                    target: INTERNAL_TARGET,
-                    ?backoff,
-                    attempt = i,
-                    ?err,
-                    evts_count = blob.evts_count,
-                    "axiom request failed"
-                );
-                SendCtl::Retry
+                if err.is_connect() {
+                    log_retry!(
+                        RetryErrKind::Transport,
+                        target: INTERNAL_TARGET,
+                        ?backoff,
+                        attempt = attempts - 1,
+                        ?err,
+                        evts_count = blob.evts_count,
+                        "axiom connect failed"
+                    );
+                    SendCtl::Retry
+                // Axiom-go retries HTTP status >=500 here:
+                // https://github.com/axiomhq/axiom-go/blob/main/axiom/client.go#L277
+                } else if matches!(err.status(), Some(status) if status.is_server_error())
+                {
+                    log_retry!(
+                        RetryErrKind::HttpStatus(err.status().unwrap()),
+                        target: INTERNAL_TARGET,
+                        ?backoff,
+                        attempt = attempts - 1,
+                        ?err,
+                        evts_count = blob.evts_count,
+                        "axiom request failed"
+                    );
+                    SendCtl::Retry
+                } else {
+                    tracing::error!(
+                        target: INTERNAL_TARGET,
+                        attempt = attempts - 1,
+                        ?err,
+                        evts_count = blob.evts_count,
+                        "non-retryable axiom request failure. dropping blob"
+                    );
+                    SendCtl::Done
+                }
             }
         };
         match ctl {
-            SendCtl::Done => break,
+            SendCtl::Done => break SendCtl::Done,
             SendCtl::Retry => {
-                tokio::time::sleep(backoff).await;
-                backoff = backoff.mul_f32(BACKOFF_MULT).min(MAX_BACKOFF);
+                let Some(remaining) =
+                    MAX_RETRY_ELAPSED.checked_sub(retry_start.elapsed())
+                else {
+                    break SendCtl::Retry;
+                };
+                if remaining.is_zero() {
+                    break SendCtl::Retry;
+                }
+                tokio::time::sleep(backoff.min(remaining)).await;
+                backoff = backoff.mul_f32(BACKOFF_MULT);
             }
         }
-    }
+    };
     if matches!(ctl, SendCtl::Retry) {
         tracing::error!(
             target: INTERNAL_TARGET,
-            max_retries = MAX_RETRIES,
+            max_retry_elapsed_ms = MAX_RETRY_ELAPSED.as_millis(),
+            attempts,
             evts_count = blob.evts_count,
-            "reached max retries for ingest batch. dropping events!"
+            "reached retry deadline for ingest batch. dropping events!"
         );
     }
 }
@@ -913,6 +946,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum StubResp {
         Ok,
+        Http400,
         Http500,
         OkBadJson,
     }
@@ -1024,6 +1058,10 @@ mod tests {
         match resp {
             StubResp::Ok => (
                 axum::http::StatusCode::OK,
+                ingest_ok(req.evts).into_response(),
+            ),
+            StubResp::Http400 => (
+                axum::http::StatusCode::BAD_REQUEST,
                 ingest_ok(req.evts).into_response(),
             ),
             StubResp::Http500 => (
@@ -1175,6 +1213,22 @@ mod tests {
             obs.reqs.iter().map(|req| req.start_seq).collect::<Vec<_>>(),
             vec![0, 0, 1]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ingest_http_400_does_not_retry() {
+        let srv = TestServer::new(ServerCfg {
+            delay: Duration::ZERO,
+            resps: vec![StubResp::Http400],
+        })
+        .await;
+        let axiom = srv.mk_axiom(8, 1, 1);
+
+        send_evts(&axiom, 1).await;
+        let obs = srv.finish(axiom).await;
+
+        assert_eq!(obs.reqs.len(), 1);
+        assert_eq!(obs.reqs[0].start_seq, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
