@@ -740,9 +740,6 @@ async fn send_blob(
     enum RetryErrKind {
         Transport,
         HttpStatus(reqwest::StatusCode),
-        RespBodyRead,
-        RespBodyParse,
-        IngestFailed,
     }
     enum SendCtl {
         Done,
@@ -967,6 +964,7 @@ mod tests {
         Ok,
         Http400,
         Http500,
+        Partial,
         OkBadJson,
     }
 
@@ -1060,6 +1058,20 @@ mod tests {
         }))
     }
 
+    fn ingest_partial(evts: usize) -> impl IntoResponse {
+        axum::Json(serde_json::json!({
+            "failed": 1,
+            "ingested": evts.saturating_sub(1),
+            "processedBytes": 0,
+            "failures": [{
+                "timestamp": "2026-03-19T00:00:00Z",
+                "error": "boom",
+            }],
+            "blocksCreated": null,
+            "walLength": null,
+        }))
+    }
+
     async fn ingest(
         State(stub): State<StubServer>,
         req: Request,
@@ -1087,6 +1099,10 @@ mod tests {
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 ingest_ok(req.evts).into_response(),
             ),
+            StubResp::Partial => (
+                axum::http::StatusCode::OK,
+                ingest_partial(req.evts).into_response(),
+            ),
             StubResp::OkBadJson => {
                 (axum::http::StatusCode::OK, "nope".into_response())
             }
@@ -1095,6 +1111,11 @@ mod tests {
 
     impl TestServer {
         async fn new(cfg: ServerCfg) -> Self {
+            let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+            Self::new_at(cfg, addr).await
+        }
+
+        async fn new_at(cfg: ServerCfg, addr: SocketAddr) -> Self {
             let stub = StubServer {
                 resps: Arc::new(Mutex::new(
                     cfg.resps.iter().copied().collect(),
@@ -1105,12 +1126,7 @@ mod tests {
             let app = Router::new()
                 .route("/v1/ingest/test", post(ingest))
                 .with_state(stub.clone());
-            let listener = tokio::net::TcpListener::bind(SocketAddr::from((
-                [127, 0, 0, 1],
-                0,
-            )))
-            .await
-            .unwrap();
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
             let addr = listener.local_addr().unwrap();
             let (shutdown_tx, shutdown_rx) =
                 tokio::sync::oneshot::channel::<()>();
@@ -1251,10 +1267,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ingest_retries_malformed_success_body() {
+    async fn ingest_partial_does_not_retry() {
         let srv = TestServer::new(ServerCfg {
             delay: Duration::ZERO,
-            resps: vec![StubResp::OkBadJson],
+            resps: vec![StubResp::Partial],
+        })
+        .await;
+        let axiom = srv.mk_axiom(8, 1, 1);
+
+        send_evts(&axiom, 1).await;
+        let obs = srv.finish(axiom).await;
+
+        assert_eq!(obs.reqs.len(), 1);
+        assert_eq!(obs.reqs[0].start_seq, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ingest_http_500_retries() {
+        let srv = TestServer::new(ServerCfg {
+            delay: Duration::ZERO,
+            resps: vec![StubResp::Http500],
         })
         .await;
         let axiom = srv.mk_axiom(8, 1, 1);
@@ -1265,6 +1297,59 @@ mod tests {
         assert_eq!(obs.reqs.len(), 2);
         assert_eq!(obs.reqs[0].start_seq, 0);
         assert_eq!(obs.reqs[1].start_seq, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ingest_connect_retries() {
+        let addr = {
+            let listener = std::net::TcpListener::bind(SocketAddr::from((
+                [127, 0, 0, 1],
+                0,
+            )))
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            addr
+        };
+        let axiom = init(Config {
+            evt_que_len: 8,
+            service_name: "test-service",
+            base_url: format!("http://{}", addr).parse().unwrap(),
+            api_key: "test-key",
+            dataset_id: "test",
+            collect_target: 1,
+            collect_timeout: Duration::from_secs(30),
+            sender_pool_size: 1,
+        });
+
+        send_evts(&axiom, 1).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let srv = TestServer::new_at(
+            ServerCfg { delay: Duration::ZERO, resps: vec![] },
+            addr,
+        )
+        .await;
+        let obs = srv.finish(axiom).await;
+
+        assert_eq!(obs.reqs.len(), 1);
+        assert_eq!(obs.reqs[0].start_seq, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ingest_malformed_success_body_does_not_retry() {
+        let srv = TestServer::new(ServerCfg {
+            delay: Duration::ZERO,
+            resps: vec![StubResp::OkBadJson],
+        })
+        .await;
+        let axiom = srv.mk_axiom(8, 1, 1);
+
+        send_evts(&axiom, 1).await;
+        let obs = srv.finish(axiom).await;
+
+        assert_eq!(obs.reqs.len(), 1);
+        assert_eq!(obs.reqs[0].start_seq, 0);
     }
 
     #[derive(Clone, Copy)]
