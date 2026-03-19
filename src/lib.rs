@@ -52,7 +52,11 @@ pub struct Config<'a> {
     pub evt_que_len: usize,
     pub service_name: &'static str,
 
-    /// Try to collect this many events before sending to axiom
+    /// Try to collect this many events before sending to axiom.
+    ///
+    /// Keep this at or below 10_000. Axiom-go's `IngestChannel` uses 10_000 as
+    /// its batch size cap:
+    /// https://github.com/axiomhq/axiom-go/blob/05ab863353532f691e2e46d72008d39897de3b6c/axiom/client.go#L444-L446
     pub collect_target: usize,
     /// If we didn't collect up to target after this duratiom, timeout and send
     /// what we have.
