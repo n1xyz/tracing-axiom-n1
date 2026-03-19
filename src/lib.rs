@@ -774,16 +774,20 @@ async fn send_blob(
                         Ok(status) => {
                             if status.failed > 0 || !status.failures.is_empty()
                             {
-                                log_retry!(
-                                    RetryErrKind::IngestFailed,
+                                // TODO: either get atomic ingest semantics
+                                // from axiom or track partial ingest and
+                                // resend only failed rows instead of dropping
+                                // the whole blob.
+                                tracing::error!(
                                     target: INTERNAL_TARGET,
-                                    ?backoff,
                                     attempt = attempts - 1,
+                                    failed = status.failed,
+                                    ingested = status.ingested,
                                     status=?status_raw,
                                     evts_count = blob.evts_count,
-                                    "axiom reported ingest failures"
+                                    "axiom reported partial ingest. dropping blob"
                                 );
-                                SendCtl::Retry
+                                SendCtl::Done
                             } else {
                                 SendCtl::Done
                             }
