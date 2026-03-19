@@ -54,9 +54,8 @@ pub struct Config<'a> {
 
     /// Try to collect this many events before sending to axiom.
     ///
-    /// Keep this at or below 10_000. Axiom-go's `IngestChannel` uses 10_000 as
-    /// its batch size cap:
-    /// https://github.com/axiomhq/axiom-go/blob/05ab863353532f691e2e46d72008d39897de3b6c/axiom/client.go#L444-L446
+    /// Should be > 0 and <= 10_000
+    /// https://axiom.co/docs/reference/limits#limits-on-ingested-data
     pub collect_target: usize,
     /// If we didn't collect up to target after this duratiom, timeout and send
     /// what we have.
@@ -88,6 +87,8 @@ where
 
     assert!(cfg.evt_que_len > 0, "evt_que_len must be > 0");
     assert!(cfg.collect_target > 0, "collect_target must be > 0");
+    // See field doc-comment
+    assert!(cfg.collect_target <= 10_000, "collect_target must be <= 10_000");
     assert!(cfg.sender_pool_size > 0, "sender_pool_size must be > 0");
 
     let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel(cfg.evt_que_len);
@@ -652,13 +653,12 @@ async fn coord_task<X>(
                     rest -= read;
                     evts_count += read;
                     for evt in &evts_buf {
-                        if let Err(err) = serde_json::to_writer(
-                            &mut encoder,
-                            &EventWrapper {
+                        if let Err(err) =
+                            serde_json::to_writer(&mut encoder, &EventWrapper {
                                 service: EventService { name: service_name },
                                 event: evt,
-                            },
-                        ) {
+                            })
+                        {
                             tracing::error!(
                                 target: INTERNAL_TARGET,
                                 ?err,
@@ -787,27 +787,21 @@ async fn send_blob(
             Ok(resp) => match resp.bytes().await {
                 Ok(status_raw) => {
                     match serde_json::from_slice::<IngestStatus>(&status_raw) {
-                        Ok(status) => {
-                            if status.failed > 0 || !status.failures.is_empty()
-                            {
-                                // TODO: either get atomic ingest semantics
-                                // from axiom or track partial ingest and
-                                // resend only failed rows instead of dropping
-                                // the whole blob.
-                                tracing::error!(
-                                    target: INTERNAL_TARGET,
-                                    attempt = attempts - 1,
-                                    failed = status.failed,
-                                    ingested = status.ingested,
-                                    status=?status_raw,
-                                    evts_count = blob.evts_count,
-                                    "axiom reported partial ingest. dropping blob"
-                                );
-                                SendCtl::Done
-                            } else {
-                                SendCtl::Done
-                            }
+                        Ok(status)
+                            if status.failed > 0
+                                || !status.failures.is_empty() =>
+                        {
+                            tracing::error!(
+                                target: INTERNAL_TARGET,
+                                attempt = attempts - 1,
+                                failed = status.failed,
+                                ingested = status.ingested,
+                                status=?status_raw,
+                                evts_count = blob.evts_count,
+                                "axiom reported partial ingest."
+                            );
                         }
+                        Ok(_) => {}
                         Err(err) => {
                             tracing::error!(
                                 target: INTERNAL_TARGET,
@@ -815,11 +809,11 @@ async fn send_blob(
                                 ?err,
                                 status = ?status_raw,
                                 evts_count = blob.evts_count,
-                                "failed to parse ingest response body. dropping blob"
+                                "failed to parse ingest response body."
                             );
-                            SendCtl::Done
                         }
                     }
+                    SendCtl::Done
                 }
                 Err(err) => {
                     tracing::error!(
@@ -846,8 +840,10 @@ async fn send_blob(
                     SendCtl::Retry
                 // Axiom-go retries HTTP status >=500 here:
                 // https://github.com/axiomhq/axiom-go/blob/main/axiom/client.go#L277
-                } else if matches!(err.status(), Some(status) if status.is_server_error())
-                {
+                } else if matches!(
+                    err.status(),
+                    Some(status) if status.is_server_error()
+                ) {
                     log_retry!(
                         RetryErrKind::HttpStatus(err.status().unwrap()),
                         target: INTERNAL_TARGET,
