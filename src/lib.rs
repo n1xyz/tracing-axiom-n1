@@ -522,6 +522,151 @@ struct EventService<'a> {
     name: &'a str,
 }
 
+// Support team told me 1<<20 max per ndjson line
+const NDJSON_LINE_LEN_MAX: usize = 1 << 20;
+const WARN_JSON_LEN_MAX: usize = 2 << 10;
+const WARN_JSON_SUFFIX: &str = "...<truncated>";
+
+struct CountWrite<W> {
+    inner: W,
+    bytes: usize,
+}
+impl<W: std::io::Write> std::io::Write for CountWrite<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let bytes = self.inner.write(buf)?;
+        self.bytes += bytes;
+        Ok(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct TruncWrite<'a> {
+    buf: &'a mut Vec<u8>,
+    limit: usize,
+    trunc: bool,
+}
+impl<'a> TruncWrite<'a> {
+    fn new(buf: &'a mut Vec<u8>, limit: usize) -> Self {
+        Self { buf, limit, trunc: false }
+    }
+}
+impl std::io::Write for TruncWrite<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let left = self.limit.saturating_sub(self.buf.len());
+        let keep = left.min(buf.len());
+        self.buf.extend_from_slice(&buf[..keep]);
+        self.trunc |= keep < buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn write_ndjson_line<W, X>(
+    writer: &mut W,
+    evt: &EventWrapper<'_, X>,
+) -> std::io::Result<usize>
+where
+    W: std::io::Write,
+    X: serde::Serialize,
+{
+    let mut writer = CountWrite { inner: writer, bytes: 0 };
+    serde_json::to_writer(&mut writer, evt).map_err(std::io::Error::other)?;
+    std::io::Write::write_all(&mut writer, b"\n")?;
+    Ok(writer.bytes)
+}
+
+fn warn_json_dump<'a, X>(
+    buf: &'a mut Vec<u8>,
+    evt: &EventWrapper<'_, X>,
+) -> Result<(&'a str, bool), serde_json::Error>
+where
+    X: serde::Serialize,
+{
+    buf.clear();
+
+    let limit = WARN_JSON_LEN_MAX.saturating_sub(WARN_JSON_SUFFIX.len());
+    let trunc = {
+        let mut writer = TruncWrite::new(buf, limit);
+        serde_json::to_writer(&mut writer, evt)?;
+        writer.trunc
+    };
+
+    let end = match std::str::from_utf8(buf) {
+        Ok(_) => buf.len(),
+        Err(err) => err.valid_up_to(),
+    };
+    buf.truncate(end);
+    if trunc {
+        buf.extend_from_slice(WARN_JSON_SUFFIX.as_bytes());
+    }
+    Ok((std::str::from_utf8(buf).unwrap(), trunc))
+}
+
+enum BatchCtl {
+    Continue,
+    DropBatch,
+    Shutdown,
+}
+
+fn encode_evt_line<W, X>(
+    encoder: &mut zstd::Encoder<'_, W>,
+    buf_warn_json: &mut Vec<u8>,
+    evt: &EventWrapper<'_, X>,
+    evts_count: usize,
+) -> BatchCtl
+where
+    W: std::io::Write,
+    X: serde::Serialize,
+{
+    let len = match write_ndjson_line(encoder, evt) {
+        Ok(bytes_line) => bytes_line,
+        Err(err) => {
+            tracing::error!(
+                target: INTERNAL_TARGET,
+                ?err,
+                evts_count,
+                "failed to encode event batch. dropping batch"
+            );
+            return BatchCtl::DropBatch;
+        }
+    };
+    if len > NDJSON_LINE_LEN_MAX {
+        match warn_json_dump(buf_warn_json, evt) {
+            Ok((event_json_truncated, event_json_was_truncated)) => {
+                tracing::warn!(
+                    target: INTERNAL_TARGET,
+                    len,
+                    bytes_limit = NDJSON_LINE_LEN_MAX,
+                    evts_count,
+                    event_json_truncated,
+                    event_json_was_truncated,
+                    "ndjson line exceeds limit"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: INTERNAL_TARGET,
+                    len,
+                    bytes_limit = NDJSON_LINE_LEN_MAX,
+                    evts_count,
+                    ?err,
+                    concat!(
+                        "ndjson line exceeds limit and warning ",
+                        "dump serialization failed"
+                    )
+                );
+            }
+        }
+    }
+    BatchCtl::Continue
+}
+
 #[derive(Default)]
 struct SenderSlot {
     /// Set by the coordinator, taken by exactly one sender task.
@@ -614,19 +759,12 @@ async fn coord_task<X>(
 ) where
     X: serde::Serialize + Send + 'static,
 {
-    use std::io::Write as _;
-
     use bytes::BufMut as _;
-
-    enum BatchCtl {
-        Continue,
-        DropBatch,
-        Shutdown,
-    }
 
     let mut zstd_ctx = zstd::zstd_safe::CCtx::try_create().unwrap();
     let mut body = bytes::BytesMut::with_capacity(2048);
     let mut evts_buf = Vec::with_capacity(collect_target);
+    let mut buf_warn_json = Vec::with_capacity(WARN_JSON_LEN_MAX);
     'batch: loop {
         let mut evts_count = 0;
 
@@ -653,28 +791,21 @@ async fn coord_task<X>(
                     rest -= read;
                     evts_count += read;
                     for evt in &evts_buf {
-                        if let Err(err) =
-                            serde_json::to_writer(&mut encoder, &EventWrapper {
-                                service: EventService { name: service_name },
-                                event: evt,
-                            })
-                        {
-                            tracing::error!(
-                                target: INTERNAL_TARGET,
-                                ?err,
-                                evts_count,
-                                "failed to encode event batch. dropping batch"
-                            );
-                            return BatchCtl::DropBatch;
-                        }
-                        if let Err(err) = encoder.write_all(b"\n") {
-                            tracing::error!(
-                                target: INTERNAL_TARGET,
-                                ?err,
-                                evts_count,
-                                "failed to encode event batch. dropping batch"
-                            );
-                            return BatchCtl::DropBatch;
+                        let evt = EventWrapper {
+                            service: EventService { name: service_name },
+                            event: evt,
+                        };
+                        match encode_evt_line(
+                            &mut encoder,
+                            &mut buf_warn_json,
+                            &evt,
+                            evts_count,
+                        ) {
+                            BatchCtl::Continue => {}
+                            BatchCtl::DropBatch => {
+                                return BatchCtl::DropBatch;
+                            }
+                            BatchCtl::Shutdown => unreachable!(),
                         }
                     }
                 }
@@ -947,7 +1078,10 @@ mod tests {
     };
     use serde::{Deserialize, Serialize};
 
-    use super::{Config, Event, init};
+    use super::{
+        Config, Event, EventService, EventWrapper, WARN_JSON_LEN_MAX,
+        WARN_JSON_SUFFIX, init, warn_json_dump, write_ndjson_line,
+    };
 
     #[derive(Clone)]
     struct ServerCfg {
@@ -975,6 +1109,8 @@ mod tests {
     #[derive(Deserialize, Serialize)]
     struct TestEvt {
         seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<String>,
     }
 
     #[derive(Default)]
@@ -1167,8 +1303,75 @@ mod tests {
 
     async fn send_evts(axiom: &super::Axiom<TestEvt>, count: u64) {
         for seq in 0..count {
-            axiom.evt_tx.send(Event::Extra(TestEvt { seq })).await.unwrap();
+            axiom
+                .evt_tx
+                .send(Event::Extra(TestEvt { seq, payload: None }))
+                .await
+                .unwrap();
         }
+    }
+
+    #[test]
+    fn ndjson_line_len_counts_bytes() {
+        let evt = EventWrapper {
+            service: EventService { name: "test-service" },
+            event: &Event::Extra(TestEvt { seq: 7, payload: None }),
+        };
+        let mut buf = Vec::new();
+
+        let bytes_line = write_ndjson_line(&mut buf, &evt).unwrap();
+
+        assert_eq!(bytes_line, buf.len());
+        assert_eq!(buf.last(), Some(&b'\n'));
+    }
+
+    #[test]
+    fn warn_json_dump_truncates_without_large_alloc() {
+        #[derive(Serialize)]
+        struct BigEvt<'a> {
+            seq: u64,
+            payload: &'a str,
+        }
+
+        static PAYLOAD: [u8; WARN_JSON_LEN_MAX * 2] =
+            [b'x'; WARN_JSON_LEN_MAX * 2];
+
+        let evt = Event::Extra(BigEvt {
+            seq: 7,
+            payload: std::str::from_utf8(&PAYLOAD).unwrap(),
+        });
+        let evt = EventWrapper {
+            service: EventService { name: "test-service" },
+            event: &evt,
+        };
+        let mut buf = Vec::with_capacity(WARN_JSON_LEN_MAX);
+
+        {
+            let (dump, trunc) = warn_json_dump(&mut buf, &evt).unwrap();
+
+            assert!(trunc);
+            assert_eq!(dump.len(), WARN_JSON_LEN_MAX);
+            assert!(dump.ends_with(WARN_JSON_SUFFIX));
+        }
+        assert_eq!(buf.len(), WARN_JSON_LEN_MAX);
+        assert!(buf.ends_with(WARN_JSON_SUFFIX.as_bytes()));
+    }
+
+    #[test]
+    fn warn_json_dump_clears_reused_buf() {
+        let evt = EventWrapper {
+            service: EventService { name: "test-service" },
+            event: &Event::Extra(TestEvt { seq: 7, payload: None }),
+        };
+        let mut buf = b"stale-bytes".to_vec();
+
+        {
+            let (dump, trunc) = warn_json_dump(&mut buf, &evt).unwrap();
+            assert!(!trunc);
+            assert!(!dump.contains("stale-bytes"));
+        }
+        assert!(!std::str::from_utf8(&buf).unwrap().contains("stale-bytes"));
+        assert!(!buf.windows("stale-bytes".len()).any(|s| s == b"stale-bytes"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1216,7 +1419,8 @@ mod tests {
 
         {
             let evt_tx = axiom.evt_tx.clone();
-            let send = evt_tx.send(Event::Extra(TestEvt { seq: 3 }));
+            let send =
+                evt_tx.send(Event::Extra(TestEvt { seq: 3, payload: None }));
             tokio::pin!(send);
             assert!(
                 tokio::time::timeout(Duration::from_millis(50), &mut send)
@@ -1360,7 +1564,9 @@ mod tests {
             S: serde::Serializer,
         {
             match self {
-                Self::Good(seq) => TestEvt { seq: *seq }.serialize(serializer),
+                Self::Good(seq) => {
+                    TestEvt { seq: *seq, payload: None }.serialize(serializer)
+                }
                 Self::Bad => Err(serde::ser::Error::custom("boom")),
             }
         }
