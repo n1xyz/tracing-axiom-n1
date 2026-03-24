@@ -1,14 +1,16 @@
 //! # tracing-axiom
 //!
-//! [Axiom.co](axiom.co) backend for the tracing crate.
+//! [Axiom.co](https://axiom.co) backend for the tracing crate.
 //!
 //! ## Usage
 //!
 //! Assumptions:
 //! - `tokio` async runtime.
-//! - `data` field configured as a mapped field in axiom dataset.
+//! - `data` field configured as a map field in your Axiom dataset.
 //! - `base_url` set to your org's Axiom edge deployment base domain:
 //!   <https://axiom.co/docs/reference/regions>
+//! - `api_key` set per Axiom ingest auth docs:
+//!   <https://axiom.co/docs/restapi/ingest>
 //!
 //! ```rs
 //! let axiom: tracing_axiom::Axiom =
@@ -47,20 +49,24 @@ pub mod layer;
 pub(crate) const INTERNAL_TARGET: &str = "tracing_axiom::internal";
 
 pub struct Config<'a> {
+    /// Axiom ingest auth token.
+    ///
+    /// See <https://axiom.co/docs/restapi/ingest>.
     pub api_key: &'a str,
     /// Base URL for your Axiom edge deployment ingest API.
     ///
     /// See <https://axiom.co/docs/reference/regions>.
     pub base_url: reqwest::Url,
+    /// Dataset name passed to `POST {base_url}/v1/ingest/{dataset_id}`.
     pub dataset_id: &'a str,
     /// Event queue length. Will start dropping events once this is full
     pub evt_que_len: usize,
     pub service_name: &'static str,
 
-    /// Try to collect this many events before sending to axiom.
+    /// Try to collect this many events before sending to Axiom.
     ///
-    /// Should be > 0 and <= 10_000
-    /// https://axiom.co/docs/reference/limits#limits-on-ingested-data
+    /// Should be > 0 and <= 10_000.
+    /// See <https://axiom.co/docs/reference/limits#limits-on-ingested-data>.
     pub collect_target: usize,
     /// If we didn't collect up to target after this duratiom, timeout and send
     /// what we have.
@@ -179,7 +185,10 @@ where
 }
 
 impl<X: Send> Axiom<X> {
-    /// Call this instead of dropping! Drop doesn't support async
+    /// Call this instead of dropping.
+    ///
+    /// Drop any cloned `evt_tx` senders first if you want a clean shutdown
+    /// without warnings. This waits for the bg sender task to flush and exit.
     pub async fn deinit(self) {
         // Non-dropping destructure. We drop the fields in this fn ourselves.
         let (evt_tx, bg_handle) = unsafe {
@@ -251,7 +260,9 @@ pub enum Event<Extra = Never> {
         target: Cow<'static, str>,
         level: Level,
         name: Cow<'static, str>,
-        /// This field is meant to be a map field in axiom
+        /// This field should be a map field in Axiom.
+        ///
+        /// See <https://axiom.co/docs/apl/data-types/map-fields>.
         data: layer::FieldCascade,
         #[serde(rename = "_time", with = "time::serde::rfc3339")]
         time: time::OffsetDateTime,
@@ -279,7 +290,9 @@ pub enum Event<Extra = Never> {
             skip_serializing_if = "Option::is_none",
             serialize_with = "layer::ser_option_field_cascade"
         )]
-        /// This field is meant to be a map field in axiom
+        /// This field should be a map field in Axiom.
+        ///
+        /// See <https://axiom.co/docs/apl/data-types/map-fields>.
         data: Option<std::sync::Arc<std::sync::Mutex<layer::FieldCascade>>>,
         #[serde(rename = "_time", with = "time::serde::rfc3339")]
         time: time::OffsetDateTime,
@@ -360,6 +373,7 @@ impl From<tracing::Level> for Level {
     }
 }
 
+// Edge ingest API response schema:
 // https://axiom.co/docs/restapi/endpoints/ingestToDataset
 #[allow(dead_code)]
 #[derive(serde::Deserialize)]

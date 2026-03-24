@@ -8,14 +8,13 @@ use tracing_subscriber::layer::SubscriberExt as _;
 #[derive(clap::Parser, Debug)]
 #[command(name = "bench_ingest")]
 struct Cli {
+    /// Axiom ingest auth token. See https://axiom.co/docs/restapi/ingest
     #[arg(long)]
     api_key: String,
-    #[arg(
-        long,
-        default_value = "https://us-east-1.aws.edge.axiom.co",
-        help = "Axiom edge deployment base URL. See https://axiom.co/docs/reference/regions"
-    )]
+    /// Axiom edge deployment base URL. See https://axiom.co/docs/reference/regions
+    #[arg(long, default_value = "https://us-east-1.aws.edge.axiom.co")]
     base_url: String,
+    /// Dataset name to ingest into.
     #[arg(long)]
     dataset_id: String,
     #[arg(
