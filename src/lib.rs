@@ -7,6 +7,8 @@
 //! Assumptions:
 //! - `tokio` async runtime.
 //! - `data` field configured as a mapped field in axiom dataset.
+//! - `base_url` set to your org's Axiom edge deployment base domain:
+//!   <https://axiom.co/docs/reference/regions>
 //!
 //! ```rs
 //! let axiom: tracing_axiom::Axiom =
@@ -46,6 +48,9 @@ pub(crate) const INTERNAL_TARGET: &str = "tracing_axiom::internal";
 
 pub struct Config<'a> {
     pub api_key: &'a str,
+    /// Base URL for your Axiom edge deployment ingest API.
+    ///
+    /// See <https://axiom.co/docs/reference/regions>.
     pub base_url: reqwest::Url,
     pub dataset_id: &'a str,
     /// Event queue length. Will start dropping events once this is full
