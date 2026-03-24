@@ -1,14 +1,16 @@
 # tracing-axiom
 
-[Axiom.co](axiom.co) backend for the tracing crate.
+[Axiom.co](https://axiom.co) backend for the tracing crate.
 
 ## Usage
 
 Assumptions:
 - `tokio` async runtime.
-- `data` field configured as a mapped field in axiom dataset.
+- `data` field configured as a map field in your Axiom dataset.
 - `base_url` set to your org's Axiom edge deployment base domain:
   <https://axiom.co/docs/reference/regions>
+- `api_key` set per Axiom ingest auth docs:
+  <https://axiom.co/docs/restapi/ingest>
 
 ```rs
 let axiom: tracing_axiom::Axiom =
