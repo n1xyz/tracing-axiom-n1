@@ -10,7 +10,11 @@ use tracing_subscriber::layer::SubscriberExt as _;
 struct Cli {
     #[arg(long)]
     api_key: String,
-    #[arg(long, default_value = "https://us-east-1.aws.edge.axiom.co")]
+    #[arg(
+        long,
+        default_value = "https://us-east-1.aws.edge.axiom.co",
+        help = "Axiom edge deployment base URL. See https://axiom.co/docs/reference/regions"
+    )]
     base_url: String,
     #[arg(long)]
     dataset_id: String,

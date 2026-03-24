@@ -7,6 +7,8 @@
 Assumptions:
 - `tokio` async runtime.
 - `data` field configured as a mapped field in axiom dataset.
+- `base_url` set to your org's Axiom edge deployment base domain:
+  <https://axiom.co/docs/reference/regions>
 
 ```rs
 let axiom: tracing_axiom::Axiom =
