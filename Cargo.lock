@@ -1908,7 +1908,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tracing-axiom"
+name = "tracing-axiom-n1"
 version = "0.1.0"
 dependencies = [
  "axum",

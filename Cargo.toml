@@ -1,7 +1,10 @@
 [package]
-name = "tracing-axiom" 
+name = "tracing-axiom-n1" 
 version = "0.1.0"
 edition = "2024"
+
+[lib]
+name = "tracing_axiom"
 
 [features]
 default = ["rustls-tls-webpki-roots"]
