@@ -16,6 +16,7 @@ Assumptions:
 let axiom: tracing_axiom::Axiom =
     tracing_axiom::init(tracing_axiom::Config {
         evt_que_len: 4 << 10,
+        met_que_len: 4 << 10,
         service_name: "example-service",
         base_url: "https://us-east-1.aws.edge.axiom.co".parse().unwrap(),
         api_key: &api_key,

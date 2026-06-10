@@ -16,6 +16,7 @@
 //! let axiom: tracing_axiom::Axiom =
 //!     tracing_axiom::init(tracing_axiom::Config {
 //!         evt_que_len: 4 << 10,
+//!         met_que_len: 4 << 10,
 //!         service_name: "example-service",
 //!         base_url: "https://us-east-1.aws.edge.axiom.co".parse().unwrap(),
 //!         api_key: &api_key,
@@ -44,7 +45,10 @@ use std::borrow::Cow;
 
 pub use reqwest::Url;
 
+
 pub mod layer;
+pub mod metrics;
+mod proto;
 
 pub(crate) const INTERNAL_TARGET: &str = "tracing_axiom::internal";
 
@@ -61,6 +65,7 @@ pub struct Config<'a> {
     pub dataset_id: &'a str,
     /// Event queue length. Will start dropping events once this is full
     pub evt_que_len: usize,
+    pub met_que_len: usize,
     pub service_name: &'static str,
 
     /// Try to collect this many events before sending to Axiom.
@@ -74,10 +79,13 @@ pub struct Config<'a> {
     /// Max number of concurrent sender jobs.
     pub sender_pool_size: usize,
 }
+
 pub struct Axiom<X: Send = Never> {
-    // NOTE: ORER MATTERS. this sender needs to be dropped before _bg_handle
+    // NOTE: ORER MATTERS. this sender needs to be dropped before _evt_handle
     pub evt_tx: tokio::sync::mpsc::Sender<Event<X>>,
-    bg_handle: Option<tokio::task::JoinHandle<()>>,
+    pub met_tx: tokio::sync::mpsc::Sender<metrics::Metric>,
+    evt_handle: Option<tokio::task::JoinHandle<()>>,
+    met_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub fn init<X>(cfg: Config) -> Axiom<X>
@@ -97,6 +105,7 @@ where
         std::time::Duration::from_secs(120);
 
     assert!(cfg.evt_que_len > 0, "evt_que_len must be > 0");
+    assert!(cfg.met_que_len > 0, "met_que_len must be > 0");
     assert!(cfg.collect_target > 0, "collect_target must be > 0");
     // See field doc-comment
     assert!(cfg.collect_target <= 10_000, "collect_target must be <= 10_000");
@@ -136,7 +145,7 @@ where
         .unwrap();
 
     let rt = tokio::runtime::Handle::current();
-    let bg_task = async move {
+    let evt_task = async move {
         let mut slots = Vec::with_capacity(cfg.sender_pool_size);
         for _ in 0..cfg.sender_pool_size {
             slots.push(SenderSlot::default());
@@ -179,9 +188,17 @@ where
     // global subscriber is installed after `init()`, so freezing the current
     // dispatch would pin this bg task to the pre-init no-op subscriber and
     // hide its internal logs from stderr/journal forever.
-    let bg_handle = rt.spawn(bg_task);
+     let evt_handle = rt.spawn(evt_task);
+   
+    //metrics
+    let (met_tx, _) = tokio::sync::mpsc::channel(cfg.met_que_len);
+    let met_task = async move {
 
-    Axiom { evt_tx: evt_tx.clone(), bg_handle: Some(bg_handle) }
+    };
+    let met_handle = rt.spawn(met_task);
+
+    Axiom { met_tx,  evt_tx: evt_tx.clone(), evt_handle: Some(evt_handle),
+        met_handle: Some(met_handle)}
 }
 
 impl<X: Send> Axiom<X> {
@@ -191,10 +208,10 @@ impl<X: Send> Axiom<X> {
     /// without warnings. This waits for the bg sender task to flush and exit.
     pub async fn deinit(self) {
         // Non-dropping destructure. We drop the fields in this fn ourselves.
-        let (evt_tx, bg_handle) = unsafe {
+        let (evt_tx, evt_handle) = unsafe {
             let this = std::mem::ManuallyDrop::new(self);
-            let Axiom { evt_tx, bg_handle } = &*this;
-            (std::ptr::read(evt_tx), std::ptr::read(bg_handle))
+            let Axiom { evt_tx, evt_handle, .. } = &*this;
+            (std::ptr::read(evt_tx), std::ptr::read(evt_handle))
         };
 
         let senders = evt_tx.strong_count() - 1;
@@ -208,7 +225,7 @@ impl<X: Send> Axiom<X> {
         // The bg task will detect this for a graceful shutdown.
         drop(evt_tx);
 
-        bg_handle.unwrap().await.unwrap();
+        evt_handle.unwrap().await.unwrap();
     }
 }
 
@@ -223,7 +240,7 @@ impl<X: Send> Drop for Axiom<X> {
     fn drop(&mut self) {
         // This is a last ditch effort to not drop events.
         let mut bogus =
-            Self { evt_tx: tokio::sync::mpsc::channel(1).0, bg_handle: None };
+            Self { met_tx:tokio::sync::mpsc::channel(1).0, evt_tx: tokio::sync::mpsc::channel(1).0, evt_handle: None, met_handle: None };
         std::mem::swap(self, &mut bogus);
         let actual = bogus;
 
@@ -1292,13 +1309,14 @@ mod tests {
             Self { addr, stub, shutdown_tx, server }
         }
 
-        fn mk_axiom(
+        fn mk_axiom_no_metrics(
             &self,
             evt_que_len: usize,
             collect_target: usize,
             sender_pool_size: usize,
         ) -> super::Axiom<TestEvt> {
             init(Config {
+                met_que_len: 1,
                 evt_que_len,
                 service_name: "test-service",
                 base_url: format!("http://{}", self.addr).parse().unwrap(),
@@ -1400,7 +1418,7 @@ mod tests {
             resps: vec![],
         })
         .await;
-        let axiom = srv.mk_axiom(8, 2, 1);
+        let axiom = srv.mk_axiom_no_metrics(8, 2, 1);
 
         send_evts(&axiom, 4).await;
         let obs = srv.finish(axiom).await;
@@ -1417,7 +1435,7 @@ mod tests {
             resps: vec![],
         })
         .await;
-        let axiom = srv.mk_axiom(8, 1, 2);
+        let axiom = srv.mk_axiom_no_metrics(8, 1, 2);
 
         send_evts(&axiom, 4).await;
         let obs = srv.finish(axiom).await;
@@ -1432,7 +1450,7 @@ mod tests {
             resps: vec![],
         })
         .await;
-        let axiom = srv.mk_axiom(1, 1, 1);
+        let axiom = srv.mk_axiom_no_metrics(1, 1, 1);
 
         send_evts(&axiom, 3).await;
 
@@ -1458,7 +1476,7 @@ mod tests {
             resps: vec![StubResp::Http500],
         })
         .await;
-        let axiom = srv.mk_axiom(8, 1, 1);
+        let axiom = srv.mk_axiom_no_metrics(8, 1, 1);
 
         send_evts(&axiom, 2).await;
         let obs = srv.finish(axiom).await;
@@ -1476,7 +1494,7 @@ mod tests {
             resps: vec![StubResp::Http400],
         })
         .await;
-        let axiom = srv.mk_axiom(8, 1, 1);
+        let axiom = srv.mk_axiom_no_metrics(8, 1, 1);
 
         send_evts(&axiom, 1).await;
         let obs = srv.finish(axiom).await;
@@ -1492,7 +1510,7 @@ mod tests {
             resps: vec![StubResp::Partial],
         })
         .await;
-        let axiom = srv.mk_axiom(8, 1, 1);
+        let axiom = srv.mk_axiom_no_metrics(8, 1, 1);
 
         send_evts(&axiom, 1).await;
         let obs = srv.finish(axiom).await;
@@ -1508,7 +1526,7 @@ mod tests {
             resps: vec![StubResp::Http500],
         })
         .await;
-        let axiom = srv.mk_axiom(8, 1, 1);
+        let axiom = srv.mk_axiom_no_metrics(8, 1, 1);
 
         send_evts(&axiom, 1).await;
         let obs = srv.finish(axiom).await;
@@ -1531,6 +1549,7 @@ mod tests {
             addr
         };
         let axiom = init(Config {
+            met_que_len: 8,
             evt_que_len: 8,
             service_name: "test-service",
             base_url: format!("http://{}", addr).parse().unwrap(),
@@ -1562,7 +1581,7 @@ mod tests {
             resps: vec![StubResp::OkBadJson],
         })
         .await;
-        let axiom = srv.mk_axiom(8, 1, 1);
+        let axiom = srv.mk_axiom_no_metrics(8, 1, 1);
 
         send_evts(&axiom, 1).await;
         let obs = srv.finish(axiom).await;
@@ -1597,6 +1616,7 @@ mod tests {
             TestServer::new(ServerCfg { delay: Duration::ZERO, resps: vec![] })
                 .await;
         let axiom = init(Config {
+            met_que_len: 8,
             evt_que_len: 8,
             service_name: "test-service",
             base_url: format!("http://{}", srv.addr).parse().unwrap(),
@@ -1627,7 +1647,7 @@ mod tests {
         let srv =
             TestServer::new(ServerCfg { delay: Duration::ZERO, resps: vec![] })
                 .await;
-        let axiom = srv.mk_axiom(8, 4, 1);
+        let axiom = srv.mk_axiom_no_metrics(8, 4, 1);
 
         send_evts(&axiom, 3).await;
         let obs = srv.finish(axiom).await;
