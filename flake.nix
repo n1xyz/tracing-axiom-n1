@@ -44,8 +44,7 @@
         let
           rust-nightly-version = "2025-08-01";
           rust-toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-          rust-toolchain-nightly =
-            pkgs.rust-bin.nightly."${rust-nightly-version}".default;
+          rust-toolchain-nightly = pkgs.rust-bin.nightly."${rust-nightly-version}".default;
           craneLib = (crane.mkLib pkgs).overrideToolchain (_: rust-toolchain);
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
@@ -69,12 +68,8 @@
           # cache keyed by Cargo.lock
           crateArtifacts = craneLib.buildDepsOnly craneCommon;
 
-          crateClippy = craneLib.cargoClippy (
-            craneCommon // { cargoArtifacts = crateArtifacts; }
-          );
-          crate = craneLib.buildPackage (
-            craneCommon // { cargoArtifacts = crateArtifacts; }
-          );
+          crateClippy = craneLib.cargoClippy (craneCommon // { cargoArtifacts = crateArtifacts; });
+          crate = craneLib.buildPackage (craneCommon // { cargoArtifacts = crateArtifacts; });
 
           treefmt = pkgs.treefmt.withConfig {
             runtimeInputs = [
