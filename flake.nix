@@ -113,6 +113,7 @@
               pkgs.rustup
               treefmt
               pkgs.coreutils
+              pkgs.protobuf
             ];
           };
         };
