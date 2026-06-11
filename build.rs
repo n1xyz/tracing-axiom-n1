@@ -2,7 +2,8 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    let manifest_dir: PathBuf  = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let manifest_dir: PathBuf =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let proto_dir: PathBuf = manifest_dir.join("proto");
 
     let proto_files = vec![
@@ -22,10 +23,8 @@ fn main() {
         println!("cargo:rerun-if-changed={}", proto_file.display());
     }
 
-    let proto_paths: Vec<_> = proto_files
-        .iter()
-        .map(|path| path.as_path())
-        .collect();
+    let proto_paths: Vec<_> =
+        proto_files.iter().map(|path| path.as_path()).collect();
 
     prost_build::Config::new()
         .compile_protos(&proto_paths, &[proto_dir.as_path()])

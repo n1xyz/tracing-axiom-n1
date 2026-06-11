@@ -2,10 +2,11 @@ use std::collections::BTreeMap;
 
 use crate::proto::opentelemetry::proto::{
     collector::metrics::v1::ExportMetricsServiceRequest,
-    common::v1::{any_value, AnyValue, InstrumentationScope, KeyValue},
+    common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value},
     metrics::v1::{
-        metric, number_data_point, AggregationTemporality as ProtoAggregationTemporality,
-        Gauge, Metric as ProtoMetric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
+        AggregationTemporality as ProtoAggregationTemporality, Gauge,
+        Metric as ProtoMetric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+        Sum, metric, number_data_point,
     },
     resource::v1::Resource,
 };
@@ -21,10 +22,7 @@ pub struct Metric {
 
 pub enum MetricData {
     Gauge,
-    Sum {
-        temporality: AggregationTemporality,
-        monotonic: bool,
-    },
+    Sum { temporality: AggregationTemporality, monotonic: bool },
 }
 
 pub enum AttrValue {
@@ -46,15 +44,15 @@ pub enum MetricValue {
 impl AttrValue {
     pub fn as_proto(self) -> AnyValue {
         match self {
-            Self::Str(s) => AnyValue {
-                value: Some(any_value::Value::StringValue(s)),
-            },
-            Self::Uz(u) => AnyValue {
-                value: Some(any_value::Value::IntValue(u as i64)),
-            },
-            Self::F(f) => AnyValue {
-                value: Some(any_value::Value::DoubleValue(f)),
-            },
+            Self::Str(s) => {
+                AnyValue { value: Some(any_value::Value::StringValue(s)) }
+            }
+            Self::Uz(u) => {
+                AnyValue { value: Some(any_value::Value::IntValue(u as i64)) }
+            }
+            Self::F(f) => {
+                AnyValue { value: Some(any_value::Value::DoubleValue(f)) }
+            }
         }
     }
 }
@@ -97,17 +95,16 @@ impl Metric {
         };
 
         let data = match self.data {
-            MetricData::Gauge => metric::Data::Gauge(Gauge {
-                data_points: vec![data_point],
-            }),
-            MetricData::Sum {
-                temporality,
-                monotonic,
-            } => metric::Data::Sum(Sum {
-                data_points: vec![data_point],
-                aggregation_temporality: temporality.as_proto() as i32,
-                is_monotonic: monotonic,
-            }),
+            MetricData::Gauge => {
+                metric::Data::Gauge(Gauge { data_points: vec![data_point] })
+            }
+            MetricData::Sum { temporality, monotonic } => {
+                metric::Data::Sum(Sum {
+                    data_points: vec![data_point],
+                    aggregation_temporality: temporality.as_proto() as i32,
+                    is_monotonic: monotonic,
+                })
+            }
         };
 
         ProtoMetric {
@@ -125,10 +122,8 @@ pub fn metrics_to_proto(
     time_unix_nano: u64,
     resource_attrs: Option<BTreeMap<String, AttrValue>>,
 ) -> ExportMetricsServiceRequest {
-    let proto_metrics = metrics
-        .into_iter()
-        .map(|m| m.as_proto(time_unix_nano))
-        .collect();
+    let proto_metrics =
+        metrics.into_iter().map(|m| m.as_proto(time_unix_nano)).collect();
 
     let scope_metrics = vec![ScopeMetrics {
         scope: Some(InstrumentationScope {
@@ -152,11 +147,8 @@ pub fn metrics_to_proto(
         ..Default::default()
     });
 
-    let resource_metrics = vec![ResourceMetrics {
-        resource,
-        scope_metrics,
-        ..Default::default()
-    }];
+    let resource_metrics =
+        vec![ResourceMetrics { resource, scope_metrics, ..Default::default() }];
 
     ExportMetricsServiceRequest { resource_metrics }
 }
