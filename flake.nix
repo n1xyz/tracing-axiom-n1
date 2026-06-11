@@ -52,6 +52,7 @@
           craneCommon = rec {
             src = craneLib.cleanCargoSource ./.;
             strictDeps = true;
+            nativeBuildInputs = [ pkgs.protobuf ];
             cargoTestCommand = "cargo test";
             cargoCheckCommand = "cargo clippy --profile release";
             cargoCheckExtraArgs = "--all-targets -- --deny=warnings";
