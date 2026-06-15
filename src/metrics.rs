@@ -11,6 +11,7 @@ use crate::proto::opentelemetry::proto::{
     resource::v1::Resource,
 };
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct Metric {
     pub name: String,
     pub description: String,
@@ -20,11 +21,13 @@ pub struct Metric {
     pub attrs: BTreeMap<String, AttrValue>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MetricData {
     Gauge,
     Sum { temporality: AggregationTemporality, monotonic: bool },
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum AttrValue {
     Str(String),
     Uz(u64),
@@ -32,11 +35,13 @@ pub enum AttrValue {
     Bool(bool),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AggregationTemporality {
     Delta,
     Cumulative,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MetricValue {
     F64(f64),
     I64(i64),
