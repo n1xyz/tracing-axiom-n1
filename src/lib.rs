@@ -797,6 +797,7 @@ struct BatchBlob {
     body: bytes::Bytes,
     items_count: usize,
     content_type: &'static str,
+    parse_ingest_status: bool,
     axiom_dataset: Option<reqwest::header::HeaderValue>,
 }
 
@@ -952,6 +953,7 @@ async fn evt_coord_task<X>(
             body: body.split().freeze(),
             items_count: evts_count,
             content_type: "application/json",
+            parse_ingest_status: true,
             axiom_dataset: None,
         };
 
@@ -1048,6 +1050,7 @@ async fn met_coord_task(
             body: body.split().freeze(),
             items_count: mets_count,
             content_type: "application/x-protobuf",
+            parse_ingest_status: false,
             axiom_dataset: Some(axiom_dataset.clone()),
         };
 
@@ -1134,6 +1137,10 @@ async fn send_blob(
             .await
             .and_then(|resp| resp.error_for_status());
         let ctl = match res {
+            Ok(resp) if !blob.parse_ingest_status => {
+                drop(resp);
+                SendCtl::Done
+            }
             Ok(resp) => match resp.bytes().await {
                 Ok(status_raw) => {
                     match serde_json::from_slice::<IngestStatus>(&status_raw) {
