@@ -29,6 +29,7 @@ pub enum AttrValue {
     Str(String),
     Uz(u64),
     F(f64),
+    Bool(bool),
 }
 
 pub enum AggregationTemporality {
@@ -52,6 +53,9 @@ impl AttrValue {
             }
             Self::F(f) => {
                 AnyValue { value: Some(any_value::Value::DoubleValue(f)) }
+            }
+            Self::Bool(b) => {
+                AnyValue { value: Some(any_value::Value::BoolValue(b)) }
             }
         }
     }
