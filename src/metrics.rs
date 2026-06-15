@@ -158,10 +158,14 @@ pub enum MetricUnit {
     KibibytesPerSecond,
     KilobytesPerSecond,
     KilobitsPerSecond,
+    BytesPerSecond,
 
     Kibibytes,
     Kilobytes,
     Kilobits,
+
+    Bytes,
+    Bits,
 
     Seconds,
     Milliseconds,
@@ -187,11 +191,15 @@ impl MetricUnit {
         match self {
             Self::KibibytesPerSecond => "KiB/s",
             Self::KilobytesPerSecond => "KB/s",
-            Self::KilobitsPerSecond => "/s",
+            Self::KilobitsPerSecond => "Kbit/s",
+            Self::BytesPerSecond => "B/s",
 
             Self::Kibibytes => "KiB",
             Self::Kilobytes => "KB",
             Self::Kilobits => "Kbit",
+
+            Self::Bytes => "B",
+            Self::Bits => "bit",
 
             Self::Seconds => "s",
             Self::Milliseconds => "ms",
