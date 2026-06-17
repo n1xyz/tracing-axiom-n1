@@ -30,7 +30,7 @@ pub enum MetricData {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AttrValue {
     Str(String),
-    Uz(u64),
+    I64(i64),
     F(f64),
     Bool(bool),
 }
@@ -53,8 +53,8 @@ impl AttrValue {
             Self::Str(s) => {
                 AnyValue { value: Some(any_value::Value::StringValue(s)) }
             }
-            Self::Uz(u) => {
-                AnyValue { value: Some(any_value::Value::IntValue(u as i64)) }
+            Self::I64(i) => {
+                AnyValue { value: Some(any_value::Value::IntValue(i)) }
             }
             Self::F(f) => {
                 AnyValue { value: Some(any_value::Value::DoubleValue(f)) }
