@@ -107,6 +107,7 @@ async fn run_phase(
     let base_url: tracing_axiom::Url = opts.base_url.parse().unwrap();
     let axiom = tracing_axiom::init(tracing_axiom::Config {
         evt_que_len: opts.evt_que_len,
+        met_que_len: opts.evt_que_len,
         service_name: "bench-ingest",
         base_url,
         api_key: &opts.api_key,

@@ -1,6 +1,9 @@
 # tracing-axiom
 
-[Axiom.co](https://axiom.co) backend for the tracing crate.
+[Axiom.co](https://axiom.co) backend for the tracing crate, including wrapper around axiom ingests for events and metrics. 
+
+Metrics ingest relies on vendoring opentelemetry protobuf files rather than us pulling in their rust crate as dependency.
+These files can be sourced [here](https://github.com/open-telemetry/opentelemetry-proto/tree/main/opentelemetry/proto), are stored in `/proto`.
 
 ## Usage
 
@@ -16,7 +19,8 @@ Assumptions:
 let axiom: tracing_axiom::Axiom =
     tracing_axiom::init(tracing_axiom::Config {
         evt_que_len: 4 << 10,
-        service_name: "example-service",
+        met_que_len: 4 << 10, 
+        service_name: "example-service", 
         base_url: "https://us-east-1.aws.edge.axiom.co".parse().unwrap(),
         api_key: &api_key,
         dataset_id: "example-dataset",
@@ -38,3 +42,4 @@ axiom.deinit().await;
 ```
 
 See `examples/simple.rs` for a working example.
+

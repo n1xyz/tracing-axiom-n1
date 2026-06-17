@@ -16,6 +16,7 @@
 //! let axiom: tracing_axiom::Axiom =
 //!     tracing_axiom::init(tracing_axiom::Config {
 //!         evt_que_len: 4 << 10,
+//!         met_que_len: 4 << 10,
 //!         service_name: "example-service",
 //!         base_url: "https://us-east-1.aws.edge.axiom.co".parse().unwrap(),
 //!         api_key: &api_key,
@@ -40,13 +41,17 @@
 //! See `examples/simple.rs` for a working example.
 //!
 
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::BTreeMap};
 
+use prost::Message as _;
 pub use reqwest::Url;
 
 pub mod layer;
+pub mod metrics;
+mod proto;
 
 pub(crate) const INTERNAL_TARGET: &str = "tracing_axiom::internal";
+const AXIOM_DATASET_HEADER: &str = "X-Axiom-Dataset";
 
 pub struct Config<'a> {
     /// Axiom ingest auth token.
@@ -61,6 +66,7 @@ pub struct Config<'a> {
     pub dataset_id: &'a str,
     /// Event queue length. Will start dropping events once this is full
     pub evt_que_len: usize,
+    pub met_que_len: usize,
     pub service_name: &'static str,
 
     /// Try to collect this many events before sending to Axiom.
@@ -74,10 +80,13 @@ pub struct Config<'a> {
     /// Max number of concurrent sender jobs.
     pub sender_pool_size: usize,
 }
+
 pub struct Axiom<X: Send = Never> {
-    // NOTE: ORER MATTERS. this sender needs to be dropped before _bg_handle
+    // NOTE: ORER MATTERS. this sender needs to be dropped before _evt_handle
     pub evt_tx: tokio::sync::mpsc::Sender<Event<X>>,
-    bg_handle: Option<tokio::task::JoinHandle<()>>,
+    pub met_tx: tokio::sync::mpsc::Sender<metrics::Metric>,
+    evt_handle: Option<tokio::task::JoinHandle<()>>,
+    met_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub fn init<X>(cfg: Config) -> Axiom<X>
@@ -97,6 +106,7 @@ where
         std::time::Duration::from_secs(120);
 
     assert!(cfg.evt_que_len > 0, "evt_que_len must be > 0");
+    assert!(cfg.met_que_len > 0, "met_que_len must be > 0");
     assert!(cfg.collect_target > 0, "collect_target must be > 0");
     // See field doc-comment
     assert!(cfg.collect_target <= 10_000, "collect_target must be <= 10_000");
@@ -109,10 +119,13 @@ where
     //       parsing is deterministic and config shouldn't be dynamic
     let ingest_url =
         cfg.base_url.join(&format!("v1/ingest/{}", cfg.dataset_id)).unwrap();
+    let metrics_url = cfg.base_url.join("v1/metrics").unwrap();
     let bearer = reqwest::header::HeaderValue::try_from(
         format!("Bearer {}", cfg.api_key), //.
     )
     .unwrap();
+    let metrics_dataset =
+        reqwest::header::HeaderValue::try_from(cfg.dataset_id).unwrap();
     let client = reqwest::Client::builder()
         .timeout(TIMEOUT_REQ)
         .connect_timeout(TIMEOUT_CONNECT)
@@ -135,23 +148,36 @@ where
         .build()
         .unwrap();
 
+    let sender_pool_size = cfg.sender_pool_size;
+    let collect_target = cfg.collect_target;
+    let collect_timeout = cfg.collect_timeout;
+    let service_name = cfg.service_name;
+
+    let evt_client = client.clone();
+    let evt_ingest_url = ingest_url.clone();
+    let evt_bearer = bearer.clone();
+    let met_client = client;
+    let met_ingest_url = metrics_url;
+    let met_bearer = bearer;
+    let met_dataset = metrics_dataset;
+
     let rt = tokio::runtime::Handle::current();
-    let bg_task = async move {
-        let mut slots = Vec::with_capacity(cfg.sender_pool_size);
-        for _ in 0..cfg.sender_pool_size {
+    let evt_task = async move {
+        let mut slots = Vec::with_capacity(sender_pool_size);
+        for _ in 0..sender_pool_size {
             slots.push(SenderSlot::default());
         }
         let slots: Box<[SenderSlot]> = slots.into_boxed_slice();
         let (idle_tx, mut idle_rx) =
-            tokio::sync::mpsc::channel(cfg.sender_pool_size);
+            tokio::sync::mpsc::channel(sender_pool_size);
 
-        let coord = coord_task(
+        let coord = evt_coord_task(
             &mut evt_rx,
             &mut idle_rx,
             &slots,
-            cfg.collect_target,
-            cfg.collect_timeout,
-            cfg.service_name,
+            collect_target,
+            collect_timeout,
+            service_name,
         );
         let senders = slots
             .iter()
@@ -162,9 +188,9 @@ where
                     id,
                     slot,
                     &idle_tx,
-                    &client,
-                    &ingest_url,
-                    &bearer,
+                    &evt_client,
+                    &evt_ingest_url,
+                    &evt_bearer,
                 ),
             })
             .collect::<Vec<_>>()
@@ -179,9 +205,58 @@ where
     // global subscriber is installed after `init()`, so freezing the current
     // dispatch would pin this bg task to the pre-init no-op subscriber and
     // hide its internal logs from stderr/journal forever.
-    let bg_handle = rt.spawn(bg_task);
+    let evt_handle = rt.spawn(evt_task);
 
-    Axiom { evt_tx: evt_tx.clone(), bg_handle: Some(bg_handle) }
+    //metrics
+    let (met_tx, mut met_rx) = tokio::sync::mpsc::channel(cfg.met_que_len);
+    let met_task = async move {
+        let mut slots = Vec::with_capacity(sender_pool_size);
+        for _ in 0..sender_pool_size {
+            slots.push(SenderSlot::default());
+        }
+        let slots: Box<[SenderSlot]> = slots.into_boxed_slice();
+        let (idle_tx, mut idle_rx) =
+            tokio::sync::mpsc::channel(sender_pool_size);
+
+        let coord = met_coord_task(
+            &mut met_rx,
+            &mut idle_rx,
+            &slots,
+            collect_target,
+            collect_timeout,
+            service_name,
+            met_dataset,
+        );
+        let senders = slots
+            .iter()
+            .enumerate()
+            .map(|(id, slot)| SenderFut {
+                done: false,
+                fut: sender_task(
+                    id,
+                    slot,
+                    &idle_tx,
+                    &met_client,
+                    &met_ingest_url,
+                    &met_bearer,
+                ),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let mut senders = Box::into_pin(senders);
+        let senders =
+            std::future::poll_fn(|cx| poll_senders(senders.as_mut(), cx));
+
+        let ((), ()) = tokio::join!(coord, senders);
+    };
+    let met_handle = rt.spawn(met_task);
+
+    Axiom {
+        met_tx,
+        evt_tx: evt_tx.clone(),
+        evt_handle: Some(evt_handle),
+        met_handle: Some(met_handle),
+    }
 }
 
 impl<X: Send> Axiom<X> {
@@ -191,10 +266,15 @@ impl<X: Send> Axiom<X> {
     /// without warnings. This waits for the bg sender task to flush and exit.
     pub async fn deinit(self) {
         // Non-dropping destructure. We drop the fields in this fn ourselves.
-        let (evt_tx, bg_handle) = unsafe {
+        let (evt_tx, met_tx, evt_handle, met_handle) = unsafe {
             let this = std::mem::ManuallyDrop::new(self);
-            let Axiom { evt_tx, bg_handle } = &*this;
-            (std::ptr::read(evt_tx), std::ptr::read(bg_handle))
+            let Axiom { evt_tx, met_tx, evt_handle, met_handle } = &*this;
+            (
+                std::ptr::read(evt_tx),
+                std::ptr::read(met_tx),
+                std::ptr::read(evt_handle),
+                std::ptr::read(met_handle),
+            )
         };
 
         let senders = evt_tx.strong_count() - 1;
@@ -204,11 +284,20 @@ impl<X: Send> Axiom<X> {
                 "deinit Axiom handle while event senders still exist!"
             );
         }
+        let senders = met_tx.strong_count() - 1;
+        if senders > 0 {
+            tracing::warn!(
+                senders,
+                "deinit Axiom handle while metric senders still exist!"
+            );
+        }
         // This should be the last strong sender and so close the channel.
-        // The bg task will detect this for a graceful shutdown.
+        // The bg tasks will detect this for a graceful shutdown.
         drop(evt_tx);
+        drop(met_tx);
 
-        bg_handle.unwrap().await.unwrap();
+        evt_handle.unwrap().await.unwrap();
+        met_handle.unwrap().await.unwrap();
     }
 }
 
@@ -222,8 +311,12 @@ impl<X: Send> Axiom<X> {
 impl<X: Send> Drop for Axiom<X> {
     fn drop(&mut self) {
         // This is a last ditch effort to not drop events.
-        let mut bogus =
-            Self { evt_tx: tokio::sync::mpsc::channel(1).0, bg_handle: None };
+        let mut bogus = Self {
+            met_tx: tokio::sync::mpsc::channel(1).0,
+            evt_tx: tokio::sync::mpsc::channel(1).0,
+            evt_handle: None,
+            met_handle: None,
+        };
         std::mem::swap(self, &mut bogus);
         let actual = bogus;
 
@@ -543,6 +636,7 @@ struct EventService<'a> {
 
 // Support team told me 1<<20 max per ndjson line
 const NDJSON_LINE_LEN_MAX: usize = 1 << 20;
+const METRICS_PROTO_LEN_WARN: usize = 1 << 20;
 const WARN_JSON_LEN_MAX: usize = 2 << 10;
 const WARN_JSON_SUFFIX: &str = "...<truncated>";
 
@@ -702,7 +796,16 @@ struct SenderSlotState {
 
 struct BatchBlob {
     body: bytes::Bytes,
-    evts_count: usize,
+    items_count: usize,
+    content_type: &'static str,
+    response_kind: ResponseKind,
+    axiom_dataset: Option<reqwest::header::HeaderValue>,
+}
+
+#[derive(Clone, Copy)]
+enum ResponseKind {
+    IngestStatus,
+    MetricsExport,
 }
 
 struct SenderFut<F> {
@@ -768,7 +871,7 @@ async fn sender_task(
     }
 }
 
-async fn coord_task<X>(
+async fn evt_coord_task<X>(
     evt_rx: &mut tokio::sync::mpsc::Receiver<Event<X>>,
     idle_rx: &mut tokio::sync::mpsc::Receiver<usize>,
     slots: &[SenderSlot],
@@ -853,7 +956,120 @@ async fn coord_task<X>(
 
         encoder.finish().unwrap();
         body = body_writer.into_inner();
-        let blob = BatchBlob { body: body.split().freeze(), evts_count };
+        let blob = BatchBlob {
+            body: body.split().freeze(),
+            items_count: evts_count,
+            content_type: "application/json",
+            response_kind: ResponseKind::IngestStatus,
+            axiom_dataset: None,
+        };
+
+        let id = idle_rx
+            .recv()
+            .await
+            .expect("sender tasks exited before coordinator");
+        let slot = &slots[id];
+        {
+            let mut state = slot.state.lock().await;
+            assert!(state.blob.is_none());
+            assert!(!state.closed);
+            state.blob = Some(blob);
+        }
+        slot.ready.notify_one();
+    }
+}
+
+async fn met_coord_task(
+    met_rx: &mut tokio::sync::mpsc::Receiver<metrics::Metric>,
+    idle_rx: &mut tokio::sync::mpsc::Receiver<usize>,
+    slots: &[SenderSlot],
+    collect_target: usize,
+    collect_timeout: std::time::Duration,
+    service_name: &'static str,
+    axiom_dataset: reqwest::header::HeaderValue,
+) {
+    use bytes::BufMut as _;
+
+    let mut zstd_ctx = zstd::zstd_safe::CCtx::try_create().unwrap();
+    let mut body = bytes::BytesMut::with_capacity(2048);
+    let mut mets_buf = Vec::with_capacity(collect_target);
+    let mut mets = Vec::with_capacity(collect_target);
+    loop {
+        let mut mets_count = 0;
+        mets.clear();
+        let mut rest = collect_target;
+
+        while mets_count == 0 {
+            match tokio::time::timeout(collect_timeout, async {
+                while rest > 0 {
+                    mets_buf.clear();
+                    let read = met_rx.recv_many(&mut mets_buf, rest).await;
+                    assert_eq!(read, mets_buf.len());
+                    if read == 0 {
+                        if mets_count == 0 && mets_buf.is_empty() {
+                            return BatchCtl::Shutdown;
+                        }
+                        return BatchCtl::Continue;
+                    }
+                    rest -= read;
+                    mets_count += read;
+                    mets.append(&mut mets_buf);
+                }
+                BatchCtl::Continue
+            })
+            .await
+            {
+                Ok(BatchCtl::Shutdown) => {
+                    close_slots(slots).await;
+                    return;
+                }
+                Ok(BatchCtl::Continue)
+                | Err(tokio::time::error::Elapsed { .. }) => {}
+                Ok(BatchCtl::DropBatch) => unreachable!(),
+            }
+        }
+
+        assert!(mets_count > 0);
+        assert!(mets_count <= collect_target);
+
+        let time_unix_nano =
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos() as u64;
+        let resource_attrs = Some(BTreeMap::from([(
+            "service.name".to_string(),
+            metrics::AttrValue::Str(service_name.to_string()),
+        )]));
+        let batch =
+            std::mem::replace(&mut mets, Vec::with_capacity(collect_target));
+        let proto =
+            metrics::metrics_to_proto(batch, time_unix_nano, resource_attrs);
+        let encoded_len = proto.encoded_len();
+        if encoded_len > METRICS_PROTO_LEN_WARN {
+            tracing::warn!(
+                target: INTERNAL_TARGET,
+                encoded_len,
+                bytes_limit = METRICS_PROTO_LEN_WARN,
+                mets_count,
+                "metrics protobuf batch exceeds warning limit"
+            );
+        }
+
+        body.clear();
+        let mut body_writer = body.writer();
+        let mut encoder = zstd::Encoder::with_context(
+            &mut body_writer, //.
+            &mut zstd_ctx,
+        );
+        std::io::Write::write_all(&mut encoder, &proto.encode_to_vec())
+            .unwrap();
+        encoder.finish().unwrap();
+        body = body_writer.into_inner();
+        let blob = BatchBlob {
+            body: body.split().freeze(),
+            items_count: mets_count,
+            content_type: "application/x-protobuf",
+            response_kind: ResponseKind::MetricsExport,
+            axiom_dataset: Some(axiom_dataset.clone()),
+        };
 
         let id = idle_rx
             .recv()
@@ -924,11 +1140,15 @@ async fn send_blob(
     let mut attempts = 0u16;
     let ctl = loop {
         attempts += 1;
-        let res = client
+        let mut req = client
             .post(ingest_url.clone())
             .header(reqwest::header::AUTHORIZATION, bearer)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::CONTENT_ENCODING, "zstd")
+            .header(reqwest::header::CONTENT_TYPE, blob.content_type)
+            .header(reqwest::header::CONTENT_ENCODING, "zstd");
+        if let Some(axiom_dataset) = &blob.axiom_dataset {
+            req = req.header(AXIOM_DATASET_HEADER, axiom_dataset);
+        }
+        let res = req
             .body(blob.body.clone())
             .send()
             .await
@@ -936,31 +1156,83 @@ async fn send_blob(
         let ctl = match res {
             Ok(resp) => match resp.bytes().await {
                 Ok(status_raw) => {
-                    match serde_json::from_slice::<IngestStatus>(&status_raw) {
-                        Ok(status)
-                            if status.failed > 0
-                                || !status.failures.is_empty() =>
-                        {
-                            tracing::error!(
-                                target: INTERNAL_TARGET,
-                                attempt = attempts - 1,
-                                failed = status.failed,
-                                ingested = status.ingested,
-                                status=?status_raw,
-                                evts_count = blob.evts_count,
-                                "axiom reported partial ingest."
-                            );
+                    match blob.response_kind {
+                        ResponseKind::IngestStatus => {
+                            match serde_json::from_slice::<IngestStatus>(
+                                &status_raw,
+                            ) {
+                                Ok(status)
+                                    if status.failed > 0
+                                        || !status.failures.is_empty() =>
+                                {
+                                    tracing::error!(
+                                        target: INTERNAL_TARGET,
+                                        attempt = attempts - 1,
+                                        failed = status.failed,
+                                        ingested = status.ingested,
+                                        status=?status_raw,
+                                        items_count = blob.items_count,
+                                        "axiom reported partial ingest."
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(err) => {
+                                    tracing::error!(
+                                        target: INTERNAL_TARGET,
+                                        attempt = attempts - 1,
+                                        ?err,
+                                        status = ?status_raw,
+                                        items_count = blob.items_count,
+                                        "failed to parse ingest response body."
+                                    );
+                                }
+                            }
                         }
-                        Ok(_) => {}
-                        Err(err) => {
-                            tracing::error!(
-                                target: INTERNAL_TARGET,
-                                attempt = attempts - 1,
-                                ?err,
-                                status = ?status_raw,
-                                evts_count = blob.evts_count,
-                                "failed to parse ingest response body."
-                            );
+                        ResponseKind::MetricsExport => {
+                            match proto::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceResponse::decode(
+                                status_raw.as_ref(),
+                            ) {
+                                Ok(status) => {
+                                    if let Some(partial_success) =
+                                        status.partial_success
+                                    {
+                                        let rejected_data_points =
+                                            partial_success
+                                                .rejected_data_points;
+                                        let error_message =
+                                            partial_success.error_message;
+                                        if rejected_data_points > 0 {
+                                            tracing::error!(
+                                                target: INTERNAL_TARGET,
+                                                attempt = attempts - 1,
+                                                rejected_data_points,
+                                                error_message,
+                                                items_count = blob.items_count,
+                                                "axiom reported partial metrics ingest."
+                                            );
+                                        } else if !error_message.is_empty() {
+                                            tracing::warn!(
+                                                target: INTERNAL_TARGET,
+                                                attempt = attempts - 1,
+                                                rejected_data_points,
+                                                error_message,
+                                                items_count = blob.items_count,
+                                                "axiom reported metrics ingest warning."
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::error!(
+                                        target: INTERNAL_TARGET,
+                                        attempt = attempts - 1,
+                                        ?err,
+                                        bytes_len = status_raw.len(),
+                                        items_count = blob.items_count,
+                                        "failed to parse metrics ingest response body."
+                                    );
+                                }
+                            }
                         }
                     }
                     SendCtl::Done
@@ -970,7 +1242,7 @@ async fn send_blob(
                         target: INTERNAL_TARGET,
                         attempt = attempts - 1,
                         ?err,
-                        evts_count = blob.evts_count,
+                        items_count = blob.items_count,
                         "failed to read ingest response body. dropping blob"
                     );
                     SendCtl::Done
@@ -984,7 +1256,7 @@ async fn send_blob(
                         ?backoff,
                         attempt = attempts - 1,
                         ?err,
-                        evts_count = blob.evts_count,
+                        items_count = blob.items_count,
                         "axiom connect failed"
                     );
                     SendCtl::Retry
@@ -1000,7 +1272,7 @@ async fn send_blob(
                         ?backoff,
                         attempt = attempts - 1,
                         ?err,
-                        evts_count = blob.evts_count,
+                        items_count = blob.items_count,
                         "axiom request failed"
                     );
                     SendCtl::Retry
@@ -1009,7 +1281,7 @@ async fn send_blob(
                         target: INTERNAL_TARGET,
                         attempt = attempts - 1,
                         ?err,
-                        evts_count = blob.evts_count,
+                        items_count = blob.items_count,
                         "non-retryable axiom request failure. dropping blob"
                     );
                     SendCtl::Done
@@ -1037,8 +1309,8 @@ async fn send_blob(
             target: INTERNAL_TARGET,
             max_retry_elapsed_ms = MAX_RETRY_ELAPSED.as_millis(),
             attempts,
-            evts_count = blob.evts_count,
-            "reached retry deadline for ingest batch. dropping events!"
+            items_count = blob.items_count,
+            "reached retry deadline for ingest batch. dropping items!"
         );
     }
 }
@@ -1082,7 +1354,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque,
+        collections::{BTreeMap, VecDeque},
         net::SocketAddr,
         sync::{Arc, Mutex},
         time::Duration,
@@ -1095,11 +1367,13 @@ mod tests {
         response::IntoResponse,
         routing::post,
     };
+    use prost::Message as _;
     use serde::{Deserialize, Serialize};
 
     use super::{
-        Config, Event, EventService, EventWrapper, WARN_JSON_LEN_MAX,
-        WARN_JSON_SUFFIX, init, warn_json_dump, write_ndjson_line,
+        AXIOM_DATASET_HEADER, Config, Event, EventService, EventWrapper,
+        WARN_JSON_LEN_MAX, WARN_JSON_SUFFIX, init, metrics, proto,
+        warn_json_dump, write_ndjson_line,
     };
 
     #[derive(Clone)]
@@ -1125,6 +1399,18 @@ mod tests {
         evts: usize,
     }
 
+    #[derive(Clone, Debug)]
+    struct MetricReqObs {
+        /// Metric count in this request body.
+        metrics: usize,
+        first_name: String,
+        first_i64: Option<i64>,
+        dataset: Option<String>,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+        service_name: Option<String>,
+    }
+
     #[derive(Deserialize, Serialize)]
     struct TestEvt {
         seq: u64,
@@ -1136,6 +1422,8 @@ mod tests {
     struct ServerObs {
         /// Request log in arrival order.
         reqs: Vec<ReqObs>,
+        /// Metric request log in arrival order.
+        metric_reqs: Vec<MetricReqObs>,
         /// Current concurrent requests inside the stub server.
         in_flight: usize,
         /// Peak concurrent requests inside the stub server.
@@ -1155,6 +1443,8 @@ mod tests {
     struct RunObs {
         /// Completed request log in arrival order.
         reqs: Vec<ReqObs>,
+        /// Completed metric request log in arrival order.
+        metric_reqs: Vec<MetricReqObs>,
         /// Peak concurrent requests observed by the stub server.
         max_in_flight: usize,
     }
@@ -1189,11 +1479,107 @@ mod tests {
         ReqObs { start_seq: start_seq.unwrap(), evts }
     }
 
+    async fn decode_metric_req(req: Request) -> MetricReqObs {
+        let (parts, body) = req.into_parts();
+        let dataset = parts
+            .headers
+            .get(AXIOM_DATASET_HEADER)
+            .map(|v| v.to_str().unwrap().to_string());
+        let content_type = parts
+            .headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string());
+        let content_encoding = parts
+            .headers
+            .get(axum::http::header::CONTENT_ENCODING)
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = to_bytes(body, usize::MAX).await.unwrap();
+        let body =
+            zstd::stream::decode_all(std::io::Cursor::new(body.as_ref()))
+                .unwrap();
+        let req =
+            proto::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest::decode(
+                body.as_slice(),
+            )
+            .unwrap();
+
+        let mut metrics_count = 0usize;
+        let mut first_name = None;
+        let mut first_i64 = None;
+        let mut service_name = None;
+
+        for resource_metrics in req.resource_metrics {
+            if let Some(resource) = resource_metrics.resource {
+                for attr in resource.attributes {
+                    if attr.key == "service.name" {
+                        let value = attr
+                            .value
+                            .and_then(|v| v.value)
+                            .and_then(|v| match v {
+                                proto::opentelemetry::proto::common::v1::any_value::Value::StringValue(s) => Some(s),
+                                _ => None,
+                            });
+                        service_name = service_name.or(value);
+                    }
+                }
+            }
+
+            for scope_metrics in resource_metrics.scope_metrics {
+                for metric in scope_metrics.metrics {
+                    metrics_count += 1;
+                    first_name.get_or_insert_with(|| metric.name.clone());
+
+                    if first_i64.is_none() {
+                        let value = metric.data.and_then(|data| match data {
+                            proto::opentelemetry::proto::metrics::v1::metric::Data::Gauge(gauge) => gauge
+                                .data_points
+                                .into_iter()
+                                .find_map(|point| point.value)
+                                .and_then(|value| match value {
+                                    proto::opentelemetry::proto::metrics::v1::number_data_point::Value::AsInt(i) => Some(i),
+                                    _ => None,
+                                }),
+                            proto::opentelemetry::proto::metrics::v1::metric::Data::Sum(sum) => sum
+                                .data_points
+                                .into_iter()
+                                .find_map(|point| point.value)
+                                .and_then(|value| match value {
+                                    proto::opentelemetry::proto::metrics::v1::number_data_point::Value::AsInt(i) => Some(i),
+                                    _ => None,
+                                }),
+                            _ => None,
+                        });
+                        first_i64 = first_i64.or(value);
+                    }
+                }
+            }
+        }
+
+        MetricReqObs {
+            metrics: metrics_count,
+            first_name: first_name.unwrap(),
+            first_i64,
+            dataset,
+            content_type,
+            content_encoding,
+            service_name,
+        }
+    }
+
     fn record_req(stub: &StubServer, req: &ReqObs) -> StubResp {
         let mut obs = stub.obs.lock().unwrap();
         obs.in_flight += 1;
         obs.max_in_flight = obs.max_in_flight.max(obs.in_flight);
         obs.reqs.push(req.clone());
+        drop(obs);
+        stub.resps.lock().unwrap().pop_front().unwrap_or(StubResp::Ok)
+    }
+
+    fn record_metric_req(stub: &StubServer, req: &MetricReqObs) -> StubResp {
+        let mut obs = stub.obs.lock().unwrap();
+        obs.in_flight += 1;
+        obs.max_in_flight = obs.max_in_flight.max(obs.in_flight);
+        obs.metric_reqs.push(req.clone());
         drop(obs);
         stub.resps.lock().unwrap().pop_front().unwrap_or(StubResp::Ok)
     }
@@ -1260,6 +1646,42 @@ mod tests {
         }
     }
 
+    async fn metrics_ingest(
+        State(stub): State<StubServer>,
+        req: Request,
+    ) -> impl IntoResponse {
+        let req = decode_metric_req(req).await;
+        let resp = record_metric_req(&stub, &req);
+
+        if stub.cfg.delay > Duration::ZERO {
+            tokio::time::sleep(stub.cfg.delay).await;
+        }
+
+        stub.obs.lock().unwrap().in_flight -= 1;
+
+        match resp {
+            StubResp::Ok => (
+                axum::http::StatusCode::OK,
+                ingest_ok(req.metrics).into_response(),
+            ),
+            StubResp::Http400 => (
+                axum::http::StatusCode::BAD_REQUEST,
+                ingest_ok(req.metrics).into_response(),
+            ),
+            StubResp::Http500 => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                ingest_ok(req.metrics).into_response(),
+            ),
+            StubResp::Partial => (
+                axum::http::StatusCode::OK,
+                ingest_partial(req.metrics).into_response(),
+            ),
+            StubResp::OkBadJson => {
+                (axum::http::StatusCode::OK, "nope".into_response())
+            }
+        }
+    }
+
     impl TestServer {
         async fn new(cfg: ServerCfg) -> Self {
             let addr = SocketAddr::from(([127, 0, 0, 1], 0));
@@ -1276,6 +1698,7 @@ mod tests {
             };
             let app = Router::new()
                 .route("/v1/ingest/test", post(ingest))
+                .route("/v1/metrics", post(metrics_ingest))
                 .with_state(stub.clone());
             let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -1292,13 +1715,14 @@ mod tests {
             Self { addr, stub, shutdown_tx, server }
         }
 
-        fn mk_axiom(
+        fn mk_axiom_no_metrics(
             &self,
             evt_que_len: usize,
             collect_target: usize,
             sender_pool_size: usize,
         ) -> super::Axiom<TestEvt> {
             init(Config {
+                met_que_len: 1,
                 evt_que_len,
                 service_name: "test-service",
                 base_url: format!("http://{}", self.addr).parse().unwrap(),
@@ -1316,7 +1740,11 @@ mod tests {
             self.server.await.unwrap();
 
             let obs = self.stub.obs.lock().unwrap();
-            RunObs { reqs: obs.reqs.clone(), max_in_flight: obs.max_in_flight }
+            RunObs {
+                reqs: obs.reqs.clone(),
+                metric_reqs: obs.metric_reqs.clone(),
+                max_in_flight: obs.max_in_flight,
+            }
         }
     }
 
@@ -1325,6 +1753,27 @@ mod tests {
             axiom
                 .evt_tx
                 .send(Event::Extra(TestEvt { seq, payload: None }))
+                .await
+                .unwrap();
+        }
+    }
+
+    fn test_metric(name: impl Into<String>, value: i64) -> metrics::Metric {
+        metrics::Metric {
+            name: name.into(),
+            description: "test metric".to_string(),
+            unit: metrics::MetricUnit::Count,
+            data: metrics::MetricData::Gauge,
+            value: metrics::MetricValue::I64(value),
+            attrs: BTreeMap::new(),
+        }
+    }
+
+    async fn send_mets(axiom: &super::Axiom<TestEvt>, count: u64) {
+        for seq in 0..count {
+            axiom
+                .met_tx
+                .send(test_metric(format!("test.metric.{seq}"), seq as i64))
                 .await
                 .unwrap();
         }
@@ -1394,13 +1843,71 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_ingest_sends_protobuf_zstd_with_axiom_headers() {
+        let srv =
+            TestServer::new(ServerCfg { delay: Duration::ZERO, resps: vec![] })
+                .await;
+        let axiom = init(Config {
+            met_que_len: 8,
+            evt_que_len: 1,
+            service_name: "test-service",
+            base_url: format!("http://{}", srv.addr).parse().unwrap(),
+            api_key: "test-key",
+            dataset_id: "test",
+            collect_target: 4,
+            collect_timeout: Duration::from_secs(30),
+            sender_pool_size: 1,
+        });
+
+        axiom.met_tx.send(test_metric("test.metric", 42)).await.unwrap();
+        let obs = srv.finish(axiom).await;
+
+        assert!(obs.reqs.is_empty());
+        assert_eq!(obs.metric_reqs.len(), 1);
+        let req = &obs.metric_reqs[0];
+        assert_eq!(req.metrics, 1);
+        assert_eq!(req.first_name, "test.metric");
+        assert_eq!(req.first_i64, Some(42));
+        assert_eq!(req.dataset.as_deref(), Some("test"));
+        assert_eq!(req.content_type.as_deref(), Some("application/x-protobuf"));
+        assert_eq!(req.content_encoding.as_deref(), Some("zstd"));
+        assert_eq!(req.service_name.as_deref(), Some("test-service"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_shutdown_flushes_partial_batch() {
+        let srv =
+            TestServer::new(ServerCfg { delay: Duration::ZERO, resps: vec![] })
+                .await;
+        let axiom = init(Config {
+            met_que_len: 8,
+            evt_que_len: 1,
+            service_name: "test-service",
+            base_url: format!("http://{}", srv.addr).parse().unwrap(),
+            api_key: "test-key",
+            dataset_id: "test",
+            collect_target: 4,
+            collect_timeout: Duration::from_secs(30),
+            sender_pool_size: 1,
+        });
+
+        send_mets(&axiom, 3).await;
+        let obs = srv.finish(axiom).await;
+
+        assert!(obs.reqs.is_empty());
+        assert_eq!(obs.metric_reqs.len(), 1);
+        assert_eq!(obs.metric_reqs[0].metrics, 3);
+        assert_eq!(obs.metric_reqs[0].first_name, "test.metric.0");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ingest_sender_pool_1_preserves_request_order() {
         let srv = TestServer::new(ServerCfg {
             delay: Duration::from_millis(50),
             resps: vec![],
         })
         .await;
-        let axiom = srv.mk_axiom(8, 2, 1);
+        let axiom = srv.mk_axiom_no_metrics(8, 2, 1);
 
         send_evts(&axiom, 4).await;
         let obs = srv.finish(axiom).await;
@@ -1417,7 +1924,7 @@ mod tests {
             resps: vec![],
         })
         .await;
-        let axiom = srv.mk_axiom(8, 1, 2);
+        let axiom = srv.mk_axiom_no_metrics(8, 1, 2);
 
         send_evts(&axiom, 4).await;
         let obs = srv.finish(axiom).await;
@@ -1432,7 +1939,7 @@ mod tests {
             resps: vec![],
         })
         .await;
-        let axiom = srv.mk_axiom(1, 1, 1);
+        let axiom = srv.mk_axiom_no_metrics(1, 1, 1);
 
         send_evts(&axiom, 3).await;
 
@@ -1458,7 +1965,7 @@ mod tests {
             resps: vec![StubResp::Http500],
         })
         .await;
-        let axiom = srv.mk_axiom(8, 1, 1);
+        let axiom = srv.mk_axiom_no_metrics(8, 1, 1);
 
         send_evts(&axiom, 2).await;
         let obs = srv.finish(axiom).await;
@@ -1476,7 +1983,7 @@ mod tests {
             resps: vec![StubResp::Http400],
         })
         .await;
-        let axiom = srv.mk_axiom(8, 1, 1);
+        let axiom = srv.mk_axiom_no_metrics(8, 1, 1);
 
         send_evts(&axiom, 1).await;
         let obs = srv.finish(axiom).await;
@@ -1492,7 +1999,7 @@ mod tests {
             resps: vec![StubResp::Partial],
         })
         .await;
-        let axiom = srv.mk_axiom(8, 1, 1);
+        let axiom = srv.mk_axiom_no_metrics(8, 1, 1);
 
         send_evts(&axiom, 1).await;
         let obs = srv.finish(axiom).await;
@@ -1508,7 +2015,7 @@ mod tests {
             resps: vec![StubResp::Http500],
         })
         .await;
-        let axiom = srv.mk_axiom(8, 1, 1);
+        let axiom = srv.mk_axiom_no_metrics(8, 1, 1);
 
         send_evts(&axiom, 1).await;
         let obs = srv.finish(axiom).await;
@@ -1531,6 +2038,7 @@ mod tests {
             addr
         };
         let axiom = init(Config {
+            met_que_len: 8,
             evt_que_len: 8,
             service_name: "test-service",
             base_url: format!("http://{}", addr).parse().unwrap(),
@@ -1562,7 +2070,7 @@ mod tests {
             resps: vec![StubResp::OkBadJson],
         })
         .await;
-        let axiom = srv.mk_axiom(8, 1, 1);
+        let axiom = srv.mk_axiom_no_metrics(8, 1, 1);
 
         send_evts(&axiom, 1).await;
         let obs = srv.finish(axiom).await;
@@ -1597,6 +2105,7 @@ mod tests {
             TestServer::new(ServerCfg { delay: Duration::ZERO, resps: vec![] })
                 .await;
         let axiom = init(Config {
+            met_que_len: 8,
             evt_que_len: 8,
             service_name: "test-service",
             base_url: format!("http://{}", srv.addr).parse().unwrap(),
@@ -1627,7 +2136,7 @@ mod tests {
         let srv =
             TestServer::new(ServerCfg { delay: Duration::ZERO, resps: vec![] })
                 .await;
-        let axiom = srv.mk_axiom(8, 4, 1);
+        let axiom = srv.mk_axiom_no_metrics(8, 4, 1);
 
         send_evts(&axiom, 3).await;
         let obs = srv.finish(axiom).await;

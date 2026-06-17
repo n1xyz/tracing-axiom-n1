@@ -1,4 +1,11 @@
 {
+  nixConfig = {
+    extra-substituters = [ "https://n1.cachix.org" ];
+    extra-trusted-public-keys = [
+      "n1.cachix.org-1:vQ3RpPAz7vsJCg0PIWXYuzG+RrgV4fJ1uQkuEvcUfQI="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     flake-parts.url = "github:hercules-ci/flake-parts";
@@ -25,14 +32,6 @@
         "aarch64-linux"
         "aarch64-darwin"
       ];
-      flake = {
-        nixConfig = {
-          extra-substituters = [ "https://n1.cachix.org" ];
-          extra-trusted-public-keys = [
-            "n1.cachix.org-1:vQ3RpPAz7vsJCg0PIWXYuzG+RrgV4fJ1uQkuEvcUfQI="
-          ];
-        };
-      };
 
       perSystem =
         {
@@ -48,10 +47,19 @@
           rust-toolchain-nightly =
             pkgs.rust-bin.nightly."${rust-nightly-version}".default;
           craneLib = (crane.mkLib pkgs).overrideToolchain (_: rust-toolchain);
+          src = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter =
+              path: type:
+              (craneLib.filterCargoSources path type)
+              || pkgs.lib.hasSuffix "/proto" path
+              || pkgs.lib.hasInfix "/proto/" path;
+          };
 
           craneCommon = rec {
-            src = craneLib.cleanCargoSource ./.;
+            inherit src;
             strictDeps = true;
+            nativeBuildInputs = [ pkgs.protobuf ];
             cargoTestCommand = "cargo test";
             cargoCheckCommand = "cargo clippy --profile release";
             cargoCheckExtraArgs = "--all-targets -- --deny=warnings";
@@ -113,6 +121,7 @@
               pkgs.rustup
               treefmt
               pkgs.coreutils
+              pkgs.protobuf
             ];
           };
         };
