@@ -797,8 +797,14 @@ struct BatchBlob {
     body: bytes::Bytes,
     items_count: usize,
     content_type: &'static str,
-    parse_ingest_status: bool,
+    response_kind: ResponseKind,
     axiom_dataset: Option<reqwest::header::HeaderValue>,
+}
+
+#[derive(Clone, Copy)]
+enum ResponseKind {
+    IngestStatus,
+    MetricsExport,
 }
 
 struct SenderFut<F> {
@@ -953,7 +959,7 @@ async fn evt_coord_task<X>(
             body: body.split().freeze(),
             items_count: evts_count,
             content_type: "application/json",
-            parse_ingest_status: true,
+            response_kind: ResponseKind::IngestStatus,
             axiom_dataset: None,
         };
 
@@ -1050,7 +1056,7 @@ async fn met_coord_task(
             body: body.split().freeze(),
             items_count: mets_count,
             content_type: "application/x-protobuf",
-            parse_ingest_status: false,
+            response_kind: ResponseKind::MetricsExport,
             axiom_dataset: Some(axiom_dataset.clone()),
         };
 
@@ -1137,37 +1143,85 @@ async fn send_blob(
             .await
             .and_then(|resp| resp.error_for_status());
         let ctl = match res {
-            Ok(resp) if !blob.parse_ingest_status => {
-                drop(resp);
-                SendCtl::Done
-            }
             Ok(resp) => match resp.bytes().await {
                 Ok(status_raw) => {
-                    match serde_json::from_slice::<IngestStatus>(&status_raw) {
-                        Ok(status)
-                            if status.failed > 0
-                                || !status.failures.is_empty() =>
-                        {
-                            tracing::error!(
-                                target: INTERNAL_TARGET,
-                                attempt = attempts - 1,
-                                failed = status.failed,
-                                ingested = status.ingested,
-                                status=?status_raw,
-                                items_count = blob.items_count,
-                                "axiom reported partial ingest."
-                            );
+                    match blob.response_kind {
+                        ResponseKind::IngestStatus => {
+                            match serde_json::from_slice::<IngestStatus>(
+                                &status_raw,
+                            ) {
+                                Ok(status)
+                                    if status.failed > 0
+                                        || !status.failures.is_empty() =>
+                                {
+                                    tracing::error!(
+                                        target: INTERNAL_TARGET,
+                                        attempt = attempts - 1,
+                                        failed = status.failed,
+                                        ingested = status.ingested,
+                                        status=?status_raw,
+                                        items_count = blob.items_count,
+                                        "axiom reported partial ingest."
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(err) => {
+                                    tracing::error!(
+                                        target: INTERNAL_TARGET,
+                                        attempt = attempts - 1,
+                                        ?err,
+                                        status = ?status_raw,
+                                        items_count = blob.items_count,
+                                        "failed to parse ingest response body."
+                                    );
+                                }
+                            }
                         }
-                        Ok(_) => {}
-                        Err(err) => {
-                            tracing::error!(
-                                target: INTERNAL_TARGET,
-                                attempt = attempts - 1,
-                                ?err,
-                                status = ?status_raw,
-                                items_count = blob.items_count,
-                                "failed to parse ingest response body."
-                            );
+                        ResponseKind::MetricsExport => {
+                            match proto::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceResponse::decode(
+                                status_raw.as_ref(),
+                            ) {
+                                Ok(status) => {
+                                    if let Some(partial_success) =
+                                        status.partial_success
+                                    {
+                                        let rejected_data_points =
+                                            partial_success
+                                                .rejected_data_points;
+                                        let error_message =
+                                            partial_success.error_message;
+                                        if rejected_data_points > 0 {
+                                            tracing::error!(
+                                                target: INTERNAL_TARGET,
+                                                attempt = attempts - 1,
+                                                rejected_data_points,
+                                                error_message,
+                                                items_count = blob.items_count,
+                                                "axiom reported partial metrics ingest."
+                                            );
+                                        } else if !error_message.is_empty() {
+                                            tracing::warn!(
+                                                target: INTERNAL_TARGET,
+                                                attempt = attempts - 1,
+                                                rejected_data_points,
+                                                error_message,
+                                                items_count = blob.items_count,
+                                                "axiom reported metrics ingest warning."
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::error!(
+                                        target: INTERNAL_TARGET,
+                                        attempt = attempts - 1,
+                                        ?err,
+                                        bytes_len = status_raw.len(),
+                                        items_count = blob.items_count,
+                                        "failed to parse metrics ingest response body."
+                                    );
+                                }
+                            }
                         }
                     }
                     SendCtl::Done
