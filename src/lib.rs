@@ -1763,8 +1763,9 @@ mod tests {
             name: name.into(),
             description: "test metric".to_string(),
             unit: metrics::MetricUnit::Count,
-            data: metrics::MetricData::Gauge,
-            value: metrics::MetricValue::I64(value),
+            data: metrics::MetricData::Gauge {
+                value: metrics::MetricValue::I64(value),
+            },
             attrs: BTreeMap::new(),
         }
     }

@@ -5,8 +5,8 @@ use crate::proto::opentelemetry::proto::{
     common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value},
     metrics::v1::{
         AggregationTemporality as ProtoAggregationTemporality, Gauge,
-        Metric as ProtoMetric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
-        Sum, metric, number_data_point,
+        Histogram, HistogramDataPoint, Metric as ProtoMetric, NumberDataPoint,
+        ResourceMetrics, ScopeMetrics, Sum, metric, number_data_point,
     },
     resource::v1::Resource,
 };
@@ -17,14 +17,28 @@ pub struct Metric {
     pub description: String,
     pub unit: MetricUnit,
     pub data: MetricData,
-    pub value: MetricValue,
     pub attrs: BTreeMap<String, AttrValue>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MetricData {
-    Gauge,
-    Sum { temporality: AggregationTemporality, monotonic: bool },
+    Gauge {
+        value: MetricValue,
+    },
+    Sum {
+        temporality: AggregationTemporality,
+        monotonic: bool,
+        value: MetricValue,
+    },
+    Histogram {
+        temporality: AggregationTemporality,
+        count: u64,
+        sum: Option<f64>,
+        bucket_counts: Vec<u64>,
+        explicit_bounds: Vec<f64>,
+        min: Option<f64>,
+        max: Option<f64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,22 +110,52 @@ impl Metric {
             })
             .collect();
 
-        let data_point = NumberDataPoint {
-            attributes,
-            time_unix_nano,
-            value: Some(self.value.as_proto()),
-            ..Default::default()
-        };
-
         let data = match self.data {
-            MetricData::Gauge => {
+            MetricData::Gauge { value } => {
+                let data_point = NumberDataPoint {
+                    attributes,
+                    time_unix_nano,
+                    value: Some(value.as_proto()),
+                    ..Default::default()
+                };
                 metric::Data::Gauge(Gauge { data_points: vec![data_point] })
             }
-            MetricData::Sum { temporality, monotonic } => {
+            MetricData::Sum { temporality, monotonic, value } => {
+                let data_point = NumberDataPoint {
+                    attributes,
+                    time_unix_nano,
+                    value: Some(value.as_proto()),
+                    ..Default::default()
+                };
                 metric::Data::Sum(Sum {
                     data_points: vec![data_point],
                     aggregation_temporality: temporality.as_proto() as i32,
                     is_monotonic: monotonic,
+                })
+            }
+            MetricData::Histogram {
+                temporality,
+                count,
+                sum,
+                bucket_counts,
+                explicit_bounds,
+                min,
+                max,
+            } => {
+                let data_point = HistogramDataPoint {
+                    attributes,
+                    time_unix_nano,
+                    count,
+                    sum,
+                    bucket_counts,
+                    explicit_bounds,
+                    min,
+                    max,
+                    ..Default::default()
+                };
+                metric::Data::Histogram(Histogram {
+                    data_points: vec![data_point],
+                    aggregation_temporality: temporality.as_proto() as i32,
                 })
             }
         };
