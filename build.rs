@@ -26,7 +26,9 @@ fn main() {
     let proto_paths: Vec<_> =
         proto_files.iter().map(|path| path.as_path()).collect();
 
+    let protoc_path = protoc_bin_vendored::protoc_bin_path().unwrap();
     prost_build::Config::new()
+        .protoc_executable(protoc_path)
         .compile_protos(&proto_paths, &[proto_dir.as_path()])
         .unwrap();
 }
