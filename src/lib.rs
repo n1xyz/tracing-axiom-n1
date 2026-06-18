@@ -20,7 +20,10 @@
 //!         service_name: "example-service",
 //!         base_url: "https://us-east-1.aws.edge.axiom.co".parse().unwrap(),
 //!         api_key: &api_key,
-//!         dataset_id: "example-dataset",
+//!         datasets: tracing_axiom::DatasetIds::All {
+//!             event_dataset_id: "example-dataset",
+//!             metric_dataset_id: "example-dataset",
+//!         },
 //!         collect_target: 4 << 10,
 //!         collect_timeout: std::time::Duration::from_millis(500),
 //!         sender_pool_size: 1,
@@ -53,6 +56,34 @@ mod proto;
 pub(crate) const INTERNAL_TARGET: &str = "tracing_axiom::internal";
 const AXIOM_DATASET_HEADER: &str = "X-Axiom-Dataset";
 
+#[derive(Clone, Copy, Debug)]
+pub enum DatasetIds<'a> {
+    /// Send events to `POST {base_url}/v1/ingest/{dataset_id}`.
+    Events { dataset_id: &'a str },
+    /// Send metrics to `POST {base_url}/v1/metrics` with `X-Axiom-Dataset`.
+    Metrics { dataset_id: &'a str },
+    /// Send events and metrics, allowing distinct Axiom datasets for each.
+    All { event_dataset_id: &'a str, metric_dataset_id: &'a str },
+}
+
+impl<'a> DatasetIds<'a> {
+    fn event_dataset_id(self) -> Option<&'a str> {
+        match self {
+            Self::Events { dataset_id } => Some(dataset_id),
+            Self::Metrics { .. } => None,
+            Self::All { event_dataset_id, .. } => Some(event_dataset_id),
+        }
+    }
+
+    fn metric_dataset_id(self) -> Option<&'a str> {
+        match self {
+            Self::Events { .. } => None,
+            Self::Metrics { dataset_id } => Some(dataset_id),
+            Self::All { metric_dataset_id, .. } => Some(metric_dataset_id),
+        }
+    }
+}
+
 pub struct Config<'a> {
     /// Axiom ingest auth token.
     ///
@@ -62,8 +93,8 @@ pub struct Config<'a> {
     ///
     /// See <https://axiom.co/docs/reference/regions>.
     pub base_url: reqwest::Url,
-    /// Dataset name passed to `POST {base_url}/v1/ingest/{dataset_id}`.
-    pub dataset_id: &'a str,
+    /// Axiom datasets to use for event and/or metric ingest.
+    pub datasets: DatasetIds<'a>,
     /// Event queue length. Will start dropping events once this is full
     pub evt_que_len: usize,
     pub met_que_len: usize,
@@ -112,20 +143,24 @@ where
     assert!(cfg.collect_target <= 10_000, "collect_target must be <= 10_000");
     assert!(cfg.sender_pool_size > 0, "sender_pool_size must be > 0");
 
-    let (evt_tx, mut evt_rx) = tokio::sync::mpsc::channel(cfg.evt_que_len);
+    let event_dataset_id = cfg.datasets.event_dataset_id();
+    let metric_dataset_id = cfg.datasets.metric_dataset_id();
+    let (evt_tx, evt_rx) = tokio::sync::mpsc::channel(cfg.evt_que_len);
+
+    // NOTE: We let tokio handle errors for these queues, you shouldnt be able to send
+    // into queue without valid dataset tagged therefore queue will not exist and we will
+    // get send err from tokio.
+    let mut evt_rx = event_dataset_id.map(|_| evt_rx);
+    let (met_tx, met_rx) = tokio::sync::mpsc::channel(cfg.met_que_len);
+    let mut met_rx = metric_dataset_id.map(|_| met_rx);
 
     // NOTE: too much effort to bubble error here. this is run once on app init
     //       so this is fine. spurious crashlooping is impossible as the
     //       parsing is deterministic and config shouldn't be dynamic
-    let ingest_url =
-        cfg.base_url.join(&format!("v1/ingest/{}", cfg.dataset_id)).unwrap();
-    let metrics_url = cfg.base_url.join("v1/metrics").unwrap();
     let bearer = reqwest::header::HeaderValue::try_from(
         format!("Bearer {}", cfg.api_key), //.
     )
     .unwrap();
-    let metrics_dataset =
-        reqwest::header::HeaderValue::try_from(cfg.dataset_id).unwrap();
     let client = reqwest::Client::builder()
         .timeout(TIMEOUT_REQ)
         .connect_timeout(TIMEOUT_CONNECT)
@@ -152,111 +187,111 @@ where
     let collect_target = cfg.collect_target;
     let collect_timeout = cfg.collect_timeout;
     let service_name = cfg.service_name;
-
-    let evt_client = client.clone();
-    let evt_ingest_url = ingest_url.clone();
-    let evt_bearer = bearer.clone();
-    let met_client = client;
-    let met_ingest_url = metrics_url;
-    let met_bearer = bearer;
-    let met_dataset = metrics_dataset;
-
     let rt = tokio::runtime::Handle::current();
-    let evt_task = async move {
-        let mut slots = Vec::with_capacity(sender_pool_size);
-        for _ in 0..sender_pool_size {
-            slots.push(SenderSlot::default());
-        }
-        let slots: Box<[SenderSlot]> = slots.into_boxed_slice();
-        let (idle_tx, mut idle_rx) =
-            tokio::sync::mpsc::channel(sender_pool_size);
 
-        let coord = evt_coord_task(
-            &mut evt_rx,
-            &mut idle_rx,
-            &slots,
-            collect_target,
-            collect_timeout,
-            service_name,
-        );
-        let senders = slots
-            .iter()
-            .enumerate()
-            .map(|(id, slot)| SenderFut {
-                done: false,
-                fut: sender_task(
-                    id,
-                    slot,
-                    &idle_tx,
-                    &evt_client,
-                    &evt_ingest_url,
-                    &evt_bearer,
-                ),
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let mut senders = Box::into_pin(senders);
-        let senders =
-            std::future::poll_fn(|cx| poll_senders(senders.as_mut(), cx));
+    let evt_handle = event_dataset_id.map(|dataset_id| {
+        let mut evt_rx = evt_rx.take().unwrap();
+        let evt_client = client.clone();
+        let evt_ingest_url =
+            cfg.base_url.join(&format!("v1/ingest/{dataset_id}")).unwrap();
+        let evt_bearer = bearer.clone();
+        let evt_task = async move {
+            let mut slots = Vec::with_capacity(sender_pool_size);
+            for _ in 0..sender_pool_size {
+                slots.push(SenderSlot::default());
+            }
+            let slots: Box<[SenderSlot]> = slots.into_boxed_slice();
+            let (idle_tx, mut idle_rx) =
+                tokio::sync::mpsc::channel(sender_pool_size);
 
-        let ((), ()) = tokio::join!(coord, senders);
-    };
-    // NOTE: don't capture the caller's current dispatch here. In telm the
-    // global subscriber is installed after `init()`, so freezing the current
-    // dispatch would pin this bg task to the pre-init no-op subscriber and
-    // hide its internal logs from stderr/journal forever.
-    let evt_handle = rt.spawn(evt_task);
+            let coord = evt_coord_task(
+                &mut evt_rx,
+                &mut idle_rx,
+                &slots,
+                collect_target,
+                collect_timeout,
+                service_name,
+            );
+            let senders = slots
+                .iter()
+                .enumerate()
+                .map(|(id, slot)| SenderFut {
+                    done: false,
+                    fut: sender_task(
+                        id,
+                        slot,
+                        &idle_tx,
+                        &evt_client,
+                        &evt_ingest_url,
+                        &evt_bearer,
+                    ),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let mut senders = Box::into_pin(senders);
+            let senders =
+                std::future::poll_fn(|cx| poll_senders(senders.as_mut(), cx));
 
-    //metrics
-    let (met_tx, mut met_rx) = tokio::sync::mpsc::channel(cfg.met_que_len);
-    let met_task = async move {
-        let mut slots = Vec::with_capacity(sender_pool_size);
-        for _ in 0..sender_pool_size {
-            slots.push(SenderSlot::default());
-        }
-        let slots: Box<[SenderSlot]> = slots.into_boxed_slice();
-        let (idle_tx, mut idle_rx) =
-            tokio::sync::mpsc::channel(sender_pool_size);
+            let ((), ()) = tokio::join!(coord, senders);
+        };
+        // NOTE: don't capture the caller's current dispatch here. In telm the
+        // global subscriber is installed after `init()`, so freezing the current
+        // dispatch would pin this bg task to the pre-init no-op subscriber and
+        // hide its internal logs from stderr/journal forever.
+        rt.spawn(evt_task)
+    });
 
-        let coord = met_coord_task(
-            &mut met_rx,
-            &mut idle_rx,
-            &slots,
-            collect_target,
-            collect_timeout,
-            service_name,
-            met_dataset,
-        );
-        let senders = slots
-            .iter()
-            .enumerate()
-            .map(|(id, slot)| SenderFut {
-                done: false,
-                fut: sender_task(
-                    id,
-                    slot,
-                    &idle_tx,
-                    &met_client,
-                    &met_ingest_url,
-                    &met_bearer,
-                ),
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let mut senders = Box::into_pin(senders);
-        let senders =
-            std::future::poll_fn(|cx| poll_senders(senders.as_mut(), cx));
+    let met_handle = metric_dataset_id.map(|dataset_id| {
+        let mut met_rx = met_rx.take().unwrap();
+        let met_client = client.clone();
+        let met_ingest_url = cfg.base_url.join("v1/metrics").unwrap();
+        let met_bearer = bearer.clone();
+        let met_dataset =
+            reqwest::header::HeaderValue::try_from(dataset_id).unwrap();
+        let met_task = async move {
+            let mut slots = Vec::with_capacity(sender_pool_size);
+            for _ in 0..sender_pool_size {
+                slots.push(SenderSlot::default());
+            }
+            let slots: Box<[SenderSlot]> = slots.into_boxed_slice();
+            let (idle_tx, mut idle_rx) =
+                tokio::sync::mpsc::channel(sender_pool_size);
 
-        let ((), ()) = tokio::join!(coord, senders);
-    };
-    let met_handle = rt.spawn(met_task);
+            let coord = met_coord_task(
+                &mut met_rx,
+                &mut idle_rx,
+                &slots,
+                collect_target,
+                collect_timeout,
+                service_name,
+                met_dataset,
+            );
+            let senders = slots
+                .iter()
+                .enumerate()
+                .map(|(id, slot)| SenderFut {
+                    done: false,
+                    fut: sender_task(
+                        id,
+                        slot,
+                        &idle_tx,
+                        &met_client,
+                        &met_ingest_url,
+                        &met_bearer,
+                    ),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let mut senders = Box::into_pin(senders);
+            let senders =
+                std::future::poll_fn(|cx| poll_senders(senders.as_mut(), cx));
 
-    Axiom {
-        met_tx,
-        evt_tx: evt_tx.clone(),
-        evt_handle: Some(evt_handle),
-        met_handle: Some(met_handle),
-    }
+            let ((), ()) = tokio::join!(coord, senders);
+        };
+        rt.spawn(met_task)
+    });
+
+    Axiom { met_tx, evt_tx, evt_handle, met_handle }
 }
 
 impl<X: Send> Axiom<X> {
@@ -296,8 +331,12 @@ impl<X: Send> Axiom<X> {
         drop(evt_tx);
         drop(met_tx);
 
-        evt_handle.unwrap().await.unwrap();
-        met_handle.unwrap().await.unwrap();
+        if let Some(evt_handle) = evt_handle {
+            evt_handle.await.unwrap();
+        }
+        if let Some(met_handle) = met_handle {
+            met_handle.await.unwrap();
+        }
     }
 }
 
@@ -1371,9 +1410,9 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::{
-        AXIOM_DATASET_HEADER, Config, Event, EventService, EventWrapper,
-        WARN_JSON_LEN_MAX, WARN_JSON_SUFFIX, init, metrics, proto,
-        warn_json_dump, write_ndjson_line,
+        AXIOM_DATASET_HEADER, Config, DatasetIds, Event, EventService,
+        EventWrapper, WARN_JSON_LEN_MAX, WARN_JSON_SUFFIX, init, metrics,
+        proto, warn_json_dump, write_ndjson_line,
     };
 
     #[derive(Clone)]
@@ -1727,7 +1766,7 @@ mod tests {
                 service_name: "test-service",
                 base_url: format!("http://{}", self.addr).parse().unwrap(),
                 api_key: "test-key",
-                dataset_id: "test",
+                datasets: DatasetIds::Events { dataset_id: "test" },
                 collect_target,
                 collect_timeout: Duration::from_secs(30),
                 sender_pool_size,
@@ -1854,7 +1893,7 @@ mod tests {
             service_name: "test-service",
             base_url: format!("http://{}", srv.addr).parse().unwrap(),
             api_key: "test-key",
-            dataset_id: "test",
+            datasets: DatasetIds::Metrics { dataset_id: "test" },
             collect_target: 4,
             collect_timeout: Duration::from_secs(30),
             sender_pool_size: 1,
@@ -1886,7 +1925,7 @@ mod tests {
             service_name: "test-service",
             base_url: format!("http://{}", srv.addr).parse().unwrap(),
             api_key: "test-key",
-            dataset_id: "test",
+            datasets: DatasetIds::Metrics { dataset_id: "test" },
             collect_target: 4,
             collect_timeout: Duration::from_secs(30),
             sender_pool_size: 1,
@@ -1899,6 +1938,83 @@ mod tests {
         assert_eq!(obs.metric_reqs.len(), 1);
         assert_eq!(obs.metric_reqs[0].metrics, 3);
         assert_eq!(obs.metric_reqs[0].first_name, "test.metric.0");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn all_datasets_can_use_distinct_metric_dataset() {
+        let srv =
+            TestServer::new(ServerCfg { delay: Duration::ZERO, resps: vec![] })
+                .await;
+        let axiom = init(Config {
+            met_que_len: 8,
+            evt_que_len: 8,
+            service_name: "test-service",
+            base_url: format!("http://{}", srv.addr).parse().unwrap(),
+            api_key: "test-key",
+            datasets: DatasetIds::All {
+                event_dataset_id: "test",
+                metric_dataset_id: "metrics-test",
+            },
+            collect_target: 4,
+            collect_timeout: Duration::from_secs(30),
+            sender_pool_size: 1,
+        });
+
+        axiom
+            .evt_tx
+            .send(Event::Extra(TestEvt { seq: 0, payload: None }))
+            .await
+            .unwrap();
+        axiom.met_tx.send(test_metric("test.metric", 42)).await.unwrap();
+        let obs = srv.finish(axiom).await;
+
+        assert_eq!(obs.reqs.len(), 1);
+        assert_eq!(obs.reqs[0].start_seq, 0);
+        assert_eq!(obs.metric_reqs.len(), 1);
+        assert_eq!(obs.metric_reqs[0].dataset.as_deref(), Some("metrics-test"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_only_closes_event_sender() {
+        let srv =
+            TestServer::new(ServerCfg { delay: Duration::ZERO, resps: vec![] })
+                .await;
+        let axiom: super::Axiom<TestEvt> = init(Config {
+            met_que_len: 8,
+            evt_que_len: 8,
+            service_name: "test-service",
+            base_url: format!("http://{}", srv.addr).parse().unwrap(),
+            api_key: "test-key",
+            datasets: DatasetIds::Metrics { dataset_id: "test" },
+            collect_target: 4,
+            collect_timeout: Duration::from_secs(30),
+            sender_pool_size: 1,
+        });
+
+        let send = axiom
+            .evt_tx
+            .send(Event::Extra(TestEvt { seq: 0, payload: None }))
+            .await;
+        assert!(send.is_err());
+        let obs = srv.finish(axiom).await;
+
+        assert!(obs.reqs.is_empty());
+        assert!(obs.metric_reqs.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn events_only_closes_metric_sender() {
+        let srv =
+            TestServer::new(ServerCfg { delay: Duration::ZERO, resps: vec![] })
+                .await;
+        let axiom = srv.mk_axiom_no_metrics(8, 4, 1);
+
+        let send = axiom.met_tx.send(test_metric("test.metric", 42)).await;
+        assert!(send.is_err());
+        let obs = srv.finish(axiom).await;
+
+        assert!(obs.reqs.is_empty());
+        assert!(obs.metric_reqs.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2044,7 +2160,7 @@ mod tests {
             service_name: "test-service",
             base_url: format!("http://{}", addr).parse().unwrap(),
             api_key: "test-key",
-            dataset_id: "test",
+            datasets: DatasetIds::Events { dataset_id: "test" },
             collect_target: 1,
             collect_timeout: Duration::from_secs(30),
             sender_pool_size: 1,
@@ -2111,7 +2227,7 @@ mod tests {
             service_name: "test-service",
             base_url: format!("http://{}", srv.addr).parse().unwrap(),
             api_key: "test-key",
-            dataset_id: "test",
+            datasets: DatasetIds::Events { dataset_id: "test" },
             collect_target: 2,
             collect_timeout: Duration::from_secs(30),
             sender_pool_size: 1,

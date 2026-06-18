@@ -111,7 +111,9 @@ async fn run_phase(
         service_name: "bench-ingest",
         base_url,
         api_key: &opts.api_key,
-        dataset_id: &opts.dataset_id,
+        datasets: tracing_axiom::DatasetIds::Events {
+            dataset_id: &opts.dataset_id,
+        },
         collect_target: opts.collect_target,
         collect_timeout: Duration::from_millis(opts.collect_timeout_ms),
         sender_pool_size: pool_size,

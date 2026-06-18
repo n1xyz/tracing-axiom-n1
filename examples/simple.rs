@@ -30,7 +30,10 @@ async fn main() {
             service_name: "example-service",
             base_url: "https://us-east-1.aws.edge.axiom.co".parse().unwrap(),
             api_key: &api_key,
-            dataset_id: "porting_test",
+            datasets: tracing_axiom::DatasetIds::All {
+                event_dataset_id: "porting_test",
+                metric_dataset_id: "porting_test",
+            },
             collect_target: 4 << 10,
             collect_timeout: std::time::Duration::from_millis(500),
             sender_pool_size: 1,
