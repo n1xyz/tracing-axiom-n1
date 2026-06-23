@@ -11,7 +11,7 @@ use crate::proto::opentelemetry::proto::{
     resource::v1::Resource,
 };
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Metric {
     pub name: String,
     pub description: String,
@@ -20,7 +20,7 @@ pub struct Metric {
     pub attrs: BTreeMap<String, AttrValue>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum MetricData {
     Gauge {
         value: MetricValue,
@@ -41,7 +41,7 @@ pub enum MetricData {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum AttrValue {
     Str(String),
     I64(i64),
@@ -49,13 +49,15 @@ pub enum AttrValue {
     Bool(bool),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize,
+)]
 pub enum AggregationTemporality {
     Delta,
     Cumulative,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub enum MetricValue {
     F64(f64),
     I64(i64),
@@ -206,7 +208,9 @@ pub fn metrics_to_proto(
     ExportMetricsServiceRequest { resource_metrics }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize,
+)]
 pub enum MetricUnit {
     KibibytesPerSecond,
     KilobytesPerSecond,
