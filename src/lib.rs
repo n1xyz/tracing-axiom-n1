@@ -675,7 +675,6 @@ struct EventService<'a> {
 
 // Support team told me 1<<20 max per ndjson line
 const NDJSON_LINE_LEN_MAX: usize = 1 << 20;
-const METRICS_PROTO_LEN_WARN: usize = 1 << 20;
 const WARN_JSON_LEN_MAX: usize = 2 << 10;
 const WARN_JSON_SUFFIX: &str = "...<truncated>";
 
@@ -1081,16 +1080,6 @@ async fn met_coord_task(
             std::mem::replace(&mut mets, Vec::with_capacity(collect_target));
         let proto =
             metrics::metrics_to_proto(batch, time_unix_nano, resource_attrs);
-        let encoded_len = proto.encoded_len();
-        if encoded_len > METRICS_PROTO_LEN_WARN {
-            tracing::warn!(
-                target: INTERNAL_TARGET,
-                encoded_len,
-                bytes_limit = METRICS_PROTO_LEN_WARN,
-                mets_count,
-                "metrics protobuf batch exceeds warning limit"
-            );
-        }
 
         body.clear();
         let mut body_writer = body.writer();
