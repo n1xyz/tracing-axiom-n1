@@ -4,9 +4,11 @@ use crate::proto::opentelemetry::proto::{
     collector::metrics::v1::ExportMetricsServiceRequest,
     common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value},
     metrics::v1::{
-        AggregationTemporality as ProtoAggregationTemporality, Gauge,
-        Histogram, HistogramDataPoint, Metric as ProtoMetric, NumberDataPoint,
-        ResourceMetrics, ScopeMetrics, Sum, metric, number_data_point,
+        AggregationTemporality as ProtoAggregationTemporality,
+        ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram,
+        HistogramDataPoint, Metric as ProtoMetric, NumberDataPoint,
+        ResourceMetrics, ScopeMetrics, Sum, exponential_histogram_data_point,
+        metric, number_data_point,
     },
     resource::v1::Resource,
 };
@@ -39,6 +41,24 @@ pub enum MetricData {
         min: Option<f64>,
         max: Option<f64>,
     },
+    ExponentialHistogram {
+        temporality: AggregationTemporality,
+        count: u64,
+        sum: Option<f64>,
+        scale: i32,
+        zero_count: u64,
+        positive: Option<ExponentialHistogramBuckets>,
+        negative: Option<ExponentialHistogramBuckets>,
+        min: Option<f64>,
+        max: Option<f64>,
+        zero_threshold: f64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ExponentialHistogramBuckets {
+    pub offset: i32,
+    pub bucket_counts: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -100,6 +120,15 @@ impl AggregationTemporality {
     }
 }
 
+impl ExponentialHistogramBuckets {
+    pub fn as_proto(self) -> exponential_histogram_data_point::Buckets {
+        exponential_histogram_data_point::Buckets {
+            offset: self.offset,
+            bucket_counts: self.bucket_counts,
+        }
+    }
+}
+
 impl Metric {
     pub fn as_proto(self, time_unix_nano: u64) -> ProtoMetric {
         let attributes = self
@@ -156,6 +185,39 @@ impl Metric {
                     ..Default::default()
                 };
                 metric::Data::Histogram(Histogram {
+                    data_points: vec![data_point],
+                    aggregation_temporality: temporality.as_proto() as i32,
+                })
+            }
+            MetricData::ExponentialHistogram {
+                temporality,
+                count,
+                sum,
+                scale,
+                zero_count,
+                positive,
+                negative,
+                min,
+                max,
+                zero_threshold,
+            } => {
+                let data_point = ExponentialHistogramDataPoint {
+                    attributes,
+                    time_unix_nano,
+                    count,
+                    sum,
+                    scale,
+                    zero_count,
+                    positive: positive
+                        .map(ExponentialHistogramBuckets::as_proto),
+                    negative: negative
+                        .map(ExponentialHistogramBuckets::as_proto),
+                    min,
+                    max,
+                    zero_threshold,
+                    ..Default::default()
+                };
+                metric::Data::ExponentialHistogram(ExponentialHistogram {
                     data_points: vec![data_point],
                     aggregation_temporality: temporality.as_proto() as i32,
                 })
